@@ -2,6 +2,8 @@
 
 A lightweight terminal UI for **UxPlay's audio receiver**, providing a music-player-style interface for AirPlay audio on Linux.
 
+<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/80c846e5-50cc-4d75-9b51-36ba90e0c6e1" />
+
 ## Features
 
 - AirPlay audio reception through UxPlay
