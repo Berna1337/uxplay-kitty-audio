@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AirPlay Audio
+Comment=AirPlay audio receiver powered by UxPlay
+Exec=uxplay-audio-tui
+Icon=audio-speakers
+Terminal=true
+Categories=AudioVideo;Audio;
+StartupNotify=true

@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+
+set -u
+
+APP_NAME="uxplay-audio-tui"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP_NAME"
+ART_FILE="$CACHE_DIR/cover.jpg"
+META_FILE="$CACHE_DIR/metadata.txt"
+LOG_FILE="$CACHE_DIR/uxplay.log"
+CAVA_CONFIG="$CACHE_DIR/cava.conf"
+CAVA_FIFO="$CACHE_DIR/cava.fifo"
+
+VISUALIZER_FPS=60
+PROGRESS_INTERVAL_MS=200
+QUALITY_INTERVAL_MS=500
+FILE_CHECK_INTERVAL_MS=250
+DEFAULT_RTP_RATE=44100
+
+ART_COL=4
+ART_ROW=6
+ART_WIDTH=36
+ART_HEIGHT=18
+INFO_COL=45
+INFO_ROW=6
+PROGRESS_ROW=25
+VISUALIZER_ROW=28
+VISUALIZER_HEIGHT=7
+
+PURPLE='\033[38;5;141m'
+PURPLE_BRIGHT='\033[38;5;177m'
+WHITE='\033[97m'
+GREY='\033[38;5;245m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+UXPLAY_PID=""
+CAVA_PID=""
+
+CACHED_TITLE=""
+CACHED_ARTIST=""
+CACHED_ALBUM=""
+CACHED_GENRE=""
+
+CACHED_STREAM_CODEC="—"
+CACHED_STREAM_RATE=0
+CACHED_STREAM_BITS=0
+CACHED_STREAM_CHANNELS=0
+
+CACHED_PROGRESS_START=0
+CACHED_PROGRESS_CURRENT=0
+CACHED_PROGRESS_END=0
+CACHED_RTP_TIME=0
+
+LAST_ART_SIGNATURE=""
+LAST_META_SIGNATURE=""
+LAST_RENDERED_QUALITY=""
+LAST_RENDERED_TITLE=""
+LAST_RENDERED_ARTIST=""
+LAST_RENDERED_ALBUM=""
+LAST_RENDERED_GENRE=""
+LAST_RENDERED_PROGRESS_CURRENT=-1
+LAST_RENDERED_PROGRESS_DURATION=-1
+
+mkdir -p "$CACHE_DIR"
+rm -f "$ART_FILE" "$META_FILE" "$LOG_FILE" "$CAVA_FIFO"
+mkfifo "$CAVA_FIFO"
+
+if ! command -v uxplay >/dev/null 2>&1; then
+    echo "Error: uxplay was not found in PATH." >&2
+    exit 1
+fi
+
+# Inline artwork currently uses the Kitty graphics protocol.
+# If unavailable, the rest of the TUI continues to work.
+if command -v kitten >/dev/null 2>&1; then
+    KITTEN_BIN="$(command -v kitten)"
+elif [[ -x "$HOME/.local/kitty.app/bin/kitten" ]]; then
+    KITTEN_BIN="$HOME/.local/kitty.app/bin/kitten"
+else
+    KITTEN_BIN=""
+fi
+
+supports_kitty_graphics() {
+    [[ -n "$KITTEN_BIN" ]] || return 1
+    [[ -n "${KITTY_WINDOW_ID:-}" ]] && return 0
+    [[ "${TERM:-}" == "xterm-kitty" ]] && return 0
+    return 1
+}
+
+cleanup() {
+    trap - EXIT INT TERM
+
+    [[ -n "$UXPLAY_PID" ]] && kill "$UXPLAY_PID" 2>/dev/null || true
+    [[ -n "$CAVA_PID" ]] && kill "$CAVA_PID" 2>/dev/null || true
+
+    if supports_kitty_graphics; then
+        "$KITTEN_BIN" icat --clear 2>/dev/null || true
+    fi
+
+    printf '\033[?25h'
+    printf '\033[0m'
+    rm -f "$CAVA_FIFO"
+    clear
+}
+
+trap cleanup EXIT INT TERM
+
+move_to() { printf '\033[%s;%sH' "$1" "$2"; }
+clear_line() { printf '\033[2K'; }
+terminal_width() { tput cols; }
+terminal_height() { tput lines; }
+hide_cursor() { printf '\033[?25l'; }
+get_time_ms() { date +%s%3N; }
+
+print_centered() {
+    local row="$1" text="$2" plain_text cols start
+    cols="$(terminal_width)"
+    plain_text="$(printf '%b' "$text" | sed $'s/\033\\[[0-9;]*m//g')"
+    start=$(((cols - ${#plain_text}) / 2))
+    (( start < 1 )) && start=1
+    move_to "$row" 1
+    clear_line
+    move_to "$row" "$start"
+    printf '%b' "$text"
+}
+
+get_file_signature() {
+    local file="$1"
+    [[ -f "$file" ]] && stat -c '%Y:%s' "$file" 2>/dev/null || true
+}
+
+metadata_lines() {
+    [[ -s "$META_FILE" ]] || return
+    tr -d '\000' < "$META_FILE" 2>/dev/null \
+        | iconv -f UTF-8 -t UTF-8//IGNORE 2>/dev/null \
+        | sed '/^[[:space:]]*$/d'
+}
+
+read_metadata_value() {
+    local key="$1"
+    metadata_lines | awk -v key="$key" '
+        BEGIN { IGNORECASE=1 }
+        $0 ~ "^" key "[[:space:]]*:" {
+            sub("^[^:]*:[[:space:]]*", "")
+            print
+            exit
+        }
+    '
+}
+
+update_metadata_cache() {
+    # Treat each metadata update as a complete snapshot so absent fields
+    # clear values from the previous track.
+    CACHED_TITLE="$(read_metadata_value "Title")"
+    CACHED_ARTIST="$(read_metadata_value "Artist")"
+    CACHED_ALBUM="$(read_metadata_value "Album")"
+    CACHED_GENRE="$(read_metadata_value "Genre")"
+}
+
+update_stream_format_cache() {
+    [[ -s "$LOG_FILE" ]] || return
+    local line codec rate bits channels
+
+    line="$(
+        tail -n 3000 "$LOG_FILE" 2>/dev/null \
+            | grep -E 'format[[:space:]]+(ALAC|AAC-ELD|AAC|LPCM|PCM)[[:space:]]+[0-9]+(/[0-9]+)?/[0-9]+' \
+            | tail -n 1
+    )"
+    [[ -n "$line" ]] || return
+
+    if [[ "$line" =~ format[[:space:]]+(ALAC|AAC-ELD|AAC|LPCM|PCM)[[:space:]]+([0-9]+)/([0-9]+)/([0-9]+) ]]; then
+        codec="${BASH_REMATCH[1]}"
+        rate="${BASH_REMATCH[2]}"
+        bits="${BASH_REMATCH[3]}"
+        channels="${BASH_REMATCH[4]}"
+
+        if [[ "$rate" =~ ^[0-9]+$ && "$bits" =~ ^[0-9]+$ && "$channels" =~ ^[0-9]+$ ]]; then
+            CACHED_STREAM_CODEC="$codec"
+            CACHED_STREAM_RATE="$rate"
+            CACHED_STREAM_BITS="$bits"
+            CACHED_STREAM_CHANNELS="$channels"
+        fi
+        return
+    fi
+
+    if [[ "$line" =~ format[[:space:]]+(ALAC|AAC-ELD|AAC|LPCM|PCM)[[:space:]]+([0-9]+)/([0-9]+) ]]; then
+        codec="${BASH_REMATCH[1]}"
+        rate="${BASH_REMATCH[2]}"
+        channels="${BASH_REMATCH[3]}"
+
+        if [[ "$rate" =~ ^[0-9]+$ && "$channels" =~ ^[0-9]+$ ]]; then
+            CACHED_STREAM_CODEC="$codec"
+            CACHED_STREAM_RATE="$rate"
+            CACHED_STREAM_BITS=0
+            CACHED_STREAM_CHANNELS="$channels"
+        fi
+    fi
+}
+
+format_sample_rate() {
+    case "$1" in
+        32000) printf '32 kHz' ;;
+        44100) printf '44.1 kHz' ;;
+        48000) printf '48 kHz' ;;
+        88200) printf '88.2 kHz' ;;
+        96000) printf '96 kHz' ;;
+        176400) printf '176.4 kHz' ;;
+        192000) printf '192 kHz' ;;
+        0|"") printf '—' ;;
+        *) printf '%s Hz' "$1" ;;
+    esac
+}
+
+format_bit_depth() {
+    local bits="$1"
+    [[ "$bits" =~ ^[0-9]+$ ]] && (( bits > 0 )) && printf '%s-bit' "$bits"
+}
+
+format_channels() {
+    case "$1" in
+        1) printf 'Mono' ;;
+        2) printf 'Stereo' ;;
+        6) printf '5.1' ;;
+        8) printf '7.1' ;;
+        0|"") printf '' ;;
+        *) printf '%s ch' "$1" ;;
+    esac
+}
+
+get_stream_quality() {
+    local rate_text bit_text channel_text quality
+    rate_text="$(format_sample_rate "$CACHED_STREAM_RATE")"
+    bit_text="$(format_bit_depth "$CACHED_STREAM_BITS")"
+    channel_text="$(format_channels "$CACHED_STREAM_CHANNELS")"
+
+    quality="$rate_text"
+    [[ -n "$bit_text" ]] && quality+=" • $bit_text"
+    [[ "$CACHED_STREAM_CODEC" != "—" ]] && quality+=" • $CACHED_STREAM_CODEC"
+    [[ -n "$channel_text" ]] && quality+=" • $channel_text"
+    printf '%s' "$quality"
+}
+
+update_progress_cache() {
+    [[ -s "$LOG_FILE" ]] || return
+    local progress_line start current end rtp_line rtp
+
+    progress_line="$(
+        tail -n 1500 "$LOG_FILE" 2>/dev/null \
+            | grep -a '^progress:' \
+            | tail -n 1
+    )"
+
+    if [[ "$progress_line" =~ ^progress:[[:space:]]*([0-9]+)/([0-9]+)/([0-9]+) ]]; then
+        start="${BASH_REMATCH[1]}"
+        current="${BASH_REMATCH[2]}"
+        end="${BASH_REMATCH[3]}"
+
+        if (( start > 0 && current >= start && end > start )); then
+            if (( start != CACHED_PROGRESS_START || end != CACHED_PROGRESS_END )); then
+                CACHED_RTP_TIME="$current"
+            fi
+            CACHED_PROGRESS_START="$start"
+            CACHED_PROGRESS_CURRENT="$current"
+            CACHED_PROGRESS_END="$end"
+        fi
+    fi
+
+    rtp_line="$(
+        tail -n 500 "$LOG_FILE" 2>/dev/null \
+            | grep -a 'rtp_time=' \
+            | tail -n 1
+    )"
+
+    if [[ "$rtp_line" =~ rtp_time=([0-9]+) ]]; then
+        rtp="${BASH_REMATCH[1]}"
+        if (( CACHED_PROGRESS_START > 0 &&
+              CACHED_PROGRESS_END > CACHED_PROGRESS_START &&
+              rtp >= CACHED_PROGRESS_START &&
+              rtp <= CACHED_PROGRESS_END )); then
+            CACHED_RTP_TIME="$rtp"
+        fi
+    fi
+}
+
+get_active_rtp_rate() {
+    if [[ "$CACHED_STREAM_RATE" =~ ^[0-9]+$ ]] && (( CACHED_STREAM_RATE > 0 )); then
+        printf '%s' "$CACHED_STREAM_RATE"
+    else
+        printf '%s' "$DEFAULT_RTP_RATE"
+    fi
+}
+
+get_duration_seconds() {
+    local rate
+    rate="$(get_active_rtp_rate)"
+    if (( CACHED_PROGRESS_START <= 0 || CACHED_PROGRESS_END <= CACHED_PROGRESS_START )); then
+        printf '0'
+        return
+    fi
+    printf '%d' $(((CACHED_PROGRESS_END - CACHED_PROGRESS_START) / rate))
+}
+
+get_position_seconds() {
+    local rate current
+    rate="$(get_active_rtp_rate)"
+
+    if (( CACHED_PROGRESS_START <= 0 || CACHED_PROGRESS_END <= CACHED_PROGRESS_START )); then
+        printf '0'
+        return
+    fi
+
+    current="$CACHED_RTP_TIME"
+    if (( current < CACHED_PROGRESS_START || current > CACHED_PROGRESS_END )); then
+        current="$CACHED_PROGRESS_CURRENT"
+    fi
+
+    (( current < CACHED_PROGRESS_START )) && current="$CACHED_PROGRESS_START"
+    (( current > CACHED_PROGRESS_END )) && current="$CACHED_PROGRESS_END"
+
+    printf '%d' $(((current - CACHED_PROGRESS_START) / rate))
+}
+
+draw_header() {
+    local quality
+    quality="$(get_stream_quality)"
+    print_centered 1 "${PURPLE_BRIGHT}${BOLD}AirPlay${RESET}"
+    print_centered 2 "${PURPLE}────────────────────────────────${RESET}"
+    print_centered 3 "${GREY}${quality}${RESET}"
+    LAST_RENDERED_QUALITY="$quality"
+}
+
+update_header_if_needed() {
+    local quality
+    quality="$(get_stream_quality)"
+    [[ "$quality" != "$LAST_RENDERED_QUALITY" ]] && draw_header
+}
+
+draw_album_art() {
+    if supports_kitty_graphics; then
+        "$KITTEN_BIN" icat --clear 2>/dev/null || true
+        if [[ -s "$ART_FILE" ]]; then
+            "$KITTEN_BIN" icat \
+                --align left \
+                --place "${ART_WIDTH}x${ART_HEIGHT}@${ART_COL}x${ART_ROW}" \
+                "$ART_FILE" 2>/dev/null || true
+            return
+        fi
+    fi
+
+    move_to 13 7
+    clear_line
+    if [[ -s "$ART_FILE" ]]; then
+        printf "${GREY}Artwork saved; inline images unsupported here.${RESET}"
+    else
+        printf "${GREY}Waiting for artwork...${RESET}"
+    fi
+}
+
+print_field() {
+    local row="$1" label="$2" value="$3"
+    move_to "$row" "$INFO_COL"
+    clear_line
+    printf "${PURPLE}${BOLD}%s${RESET}" "$label"
+    move_to "$((row + 1))" "$INFO_COL"
+    clear_line
+
+    if [[ -n "$value" ]]; then
+        printf "${WHITE}${BOLD}%s${RESET}" "$value"
+    else
+        printf "${GREY}—${RESET}"
+    fi
+}
+
+draw_metadata() {
+    print_field "$INFO_ROW" "TITLE" "$CACHED_TITLE"
+    print_field "$((INFO_ROW + 4))" "ARTIST" "$CACHED_ARTIST"
+    print_field "$((INFO_ROW + 8))" "ALBUM" "$CACHED_ALBUM"
+    print_field "$((INFO_ROW + 12))" "GENRE" "$CACHED_GENRE"
+
+    move_to "$((INFO_ROW + 16))" "$INFO_COL"
+    clear_line
+    printf "${PURPLE}●${RESET} ${GREY}AirPlay audio active${RESET}"
+
+    LAST_RENDERED_TITLE="$CACHED_TITLE"
+    LAST_RENDERED_ARTIST="$CACHED_ARTIST"
+    LAST_RENDERED_ALBUM="$CACHED_ALBUM"
+    LAST_RENDERED_GENRE="$CACHED_GENRE"
+}
+
+update_metadata_if_needed() {
+    if [[ "$CACHED_TITLE" != "$LAST_RENDERED_TITLE" ||
+          "$CACHED_ARTIST" != "$LAST_RENDERED_ARTIST" ||
+          "$CACHED_ALBUM" != "$LAST_RENDERED_ALBUM" ||
+          "$CACHED_GENRE" != "$LAST_RENDERED_GENRE" ]]; then
+        draw_metadata
+    fi
+}
+
+format_time() {
+    local seconds="${1:-0}"
+    [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=0
+    printf '%d:%02d' $((seconds / 60)) $((seconds % 60))
+}
+
+draw_progress_bar() {
+    local current="$1" duration="$2"
+    local cols bar_width filled empty start_col
+
+    cols="$(terminal_width)"
+    bar_width=$((cols - 22))
+    (( bar_width > 90 )) && bar_width=90
+    (( bar_width < 10 )) && return
+
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    [[ "$duration" =~ ^[0-9]+$ ]] || duration=0
+
+    filled=0
+    (( duration > 0 )) && filled=$((current * bar_width / duration))
+    (( filled < 0 )) && filled=0
+    (( filled > bar_width )) && filled="$bar_width"
+    empty=$((bar_width - filled))
+
+    start_col=$(((cols - bar_width - 12) / 2))
+    (( start_col < 4 )) && start_col=4
+
+    move_to "$PROGRESS_ROW" 1
+    clear_line
+    move_to "$PROGRESS_ROW" "$start_col"
+
+    if (( duration <= 0 )); then
+        printf "${GREY}--:-- ${DIM}"
+        printf '%*s' "$bar_width" '' | tr ' ' '─'
+        printf "${RESET}${GREY} --:--${RESET}"
+        LAST_RENDERED_PROGRESS_CURRENT="$current"
+        LAST_RENDERED_PROGRESS_DURATION="$duration"
+        return
+    fi
+
+    printf "${GREY}%s${RESET} " "$(format_time "$current")"
+    printf "${PURPLE_BRIGHT}"
+    (( filled > 0 )) && printf '%*s' "$filled" '' | tr ' ' '━'
+    printf "${RESET}${DIM}${GREY}"
+    (( empty > 0 )) && printf '%*s' "$empty" '' | tr ' ' '─'
+    printf "${RESET} ${GREY}%s${RESET}" "$(format_time "$duration")"
+
+    LAST_RENDERED_PROGRESS_CURRENT="$current"
+    LAST_RENDERED_PROGRESS_DURATION="$duration"
+}
+
+update_progress_display() {
+    local current duration
+    current="$(get_position_seconds)"
+    duration="$(get_duration_seconds)"
+
+    if (( current != LAST_RENDERED_PROGRESS_CURRENT || duration != LAST_RENDERED_PROGRESS_DURATION )); then
+        draw_progress_bar "$current" "$duration"
+    fi
+}
+
+draw_visualizer_frame() {
+    local data="$1"
+    local cols max_bars count bar_count spectrum_width spectrum_col
+    local row index value level
+    local values
+
+    cols="$(terminal_width)"
+    max_bars=$(((cols - 8) / 2))
+    (( max_bars > 64 )) && max_bars=64
+    (( max_bars < 10 )) && return
+
+    IFS=';' read -ra values <<< "$data"
+    count=${#values[@]}
+    (( count == 0 )) && return
+
+    bar_count="$count"
+    (( bar_count > max_bars )) && bar_count="$max_bars"
+
+    spectrum_width=$((bar_count * 2))
+    spectrum_col=$(((cols - spectrum_width) / 2))
+    (( spectrum_col < 2 )) && spectrum_col=2
+
+    for ((row = VISUALIZER_HEIGHT; row >= 1; row--)); do
+        move_to "$((VISUALIZER_ROW + VISUALIZER_HEIGHT - row))" 1
+        clear_line
+        move_to "$((VISUALIZER_ROW + VISUALIZER_HEIGHT - row))" "$spectrum_col"
+        printf "${PURPLE_BRIGHT}"
+
+        for ((index = 0; index < bar_count; index++)); do
+            value="${values[$index]}"
+            [[ "$value" =~ ^[0-9]+$ ]] || value=0
+            level=$((value * VISUALIZER_HEIGHT / 8))
+            if (( level >= row )); then
+                printf '█'
+            else
+                printf ' '
+            fi
+            printf ' '
+        done
+
+        printf "${RESET}"
+    done
+}
+
+draw_visualizer_idle() {
+    local row text
+    for ((row = 0; row < VISUALIZER_HEIGHT; row++)); do
+        move_to "$((VISUALIZER_ROW + row))" 1
+        clear_line
+    done
+
+    if [[ -z "$CAVA_PID" ]]; then
+        text="cava not installed — visualizer disabled"
+    else
+        text="Waiting for audio..."
+    fi
+    print_centered "$((VISUALIZER_ROW + 3))" "${GREY}${text}${RESET}"
+}
+
+draw_footer() {
+    print_centered "$(terminal_height)" "${GREY}Ctrl+C to quit${RESET}"
+}
+
+draw_screen() {
+    clear
+    draw_header
+    draw_album_art
+    draw_metadata
+    draw_progress_bar "$(get_position_seconds)" "$(get_duration_seconds)"
+    draw_footer
+}
+
+uxplay \
+    -d \
+    -async \
+    -ca "$ART_FILE" \
+    -md "$META_FILE" \
+    >"$LOG_FILE" 2>&1 &
+
+UXPLAY_PID=$!
+
+cat > "$CAVA_CONFIG" <<EOF
+[general]
+bars = 48
+framerate = ${VISUALIZER_FPS}
+
+[input]
+method = pulse
+source = auto
+
+[output]
+method = raw
+raw_target = ${CAVA_FIFO}
+data_format = ascii
+ascii_max_range = 8
+channels = mono
+
+[smoothing]
+noise_reduction = 65
+EOF
+
+if command -v cava >/dev/null 2>&1; then
+    cava -p "$CAVA_CONFIG" >/dev/null 2>&1 &
+    CAVA_PID=$!
+fi
+
+hide_cursor
+draw_screen
+draw_visualizer_idle
+
+if [[ -n "$CAVA_PID" ]]; then
+    exec 3<>"$CAVA_FIFO"
+fi
+
+last_progress_check_ms=0
+last_quality_check_ms=0
+last_file_check_ms=0
+
+while kill -0 "$UXPLAY_PID" 2>/dev/null; do
+    now_ms="$(get_time_ms)"
+
+    if (( now_ms - last_file_check_ms >= FILE_CHECK_INTERVAL_MS )); then
+        art_signature="$(get_file_signature "$ART_FILE")"
+        meta_signature="$(get_file_signature "$META_FILE")"
+
+        if [[ -n "$art_signature" && "$art_signature" != "$LAST_ART_SIGNATURE" ]]; then
+            draw_album_art
+            LAST_ART_SIGNATURE="$art_signature"
+        fi
+
+        if [[ -n "$meta_signature" && "$meta_signature" != "$LAST_META_SIGNATURE" ]]; then
+            update_metadata_cache
+            update_metadata_if_needed
+            LAST_META_SIGNATURE="$meta_signature"
+        fi
+
+        last_file_check_ms="$now_ms"
+    fi
+
+    if (( now_ms - last_progress_check_ms >= PROGRESS_INTERVAL_MS )); then
+        update_progress_cache
+        update_progress_display
+        last_progress_check_ms="$now_ms"
+    fi
+
+    if (( now_ms - last_quality_check_ms >= QUALITY_INTERVAL_MS )); then
+        update_stream_format_cache
+        update_header_if_needed
+        last_quality_check_ms="$now_ms"
+    fi
+
+    if [[ -n "$CAVA_PID" ]]; then
+        if IFS= read -r -t 0.016 cava_data <&3; then
+            draw_visualizer_frame "$cava_data"
+        fi
+    else
+        sleep 0.016
+    fi
+done
+
+wait "$UXPLAY_PID"
