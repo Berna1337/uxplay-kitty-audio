@@ -9,6 +9,8 @@ SETTINGS_FILE="$CONFIG_DIR/settings.conf"
 ART_FILE="$CACHE_DIR/cover.jpg"
 META_FILE="$CACHE_DIR/metadata.txt"
 LOG_FILE="$CACHE_DIR/uxplay.log"
+STATE_FILE="$CACHE_DIR/playback.state"
+UXPLAY_FIFO="$CACHE_DIR/uxplay-output.fifo"
 CAVA_CONFIG="$CACHE_DIR/cava.conf"
 CAVA_FIFO="$CACHE_DIR/cava.fifo"
 DISCORD_FIFO="$CACHE_DIR/discord.fifo"
@@ -21,10 +23,8 @@ DISCORD_GENERIC_ASSET_KEY="uxplay-kitty-audio-sound"
 DISCORD_RECONNECT_INTERVAL=5
 
 VISUALIZER_FPS=60
-PROGRESS_INTERVAL_MS=200
 QUALITY_INTERVAL_MS=500
-FILE_CHECK_INTERVAL_MS=250
-DEFAULT_RTP_RATE=44100
+FILE_CHECK_INTERVAL_MS=100
 
 ART_COL=4
 ART_ROW=6
@@ -49,6 +49,7 @@ BOLD='\033[1m'
 RESET='\033[0m'
 
 UXPLAY_PID=""
+PLAYBACK_PID=""
 CAVA_PID=""
 DISCORD_PID=""
 DISCORD_FD_OPEN=0
@@ -61,19 +62,19 @@ CACHED_ARTIST=""
 CACHED_ALBUM=""
 CACHED_GENRE=""
 CACHED_DEVICE=""
+CACHED_POSITION=0
+CACHED_DURATION=0
+CACHED_PLAYBACK_KIND="pending"
+CACHED_STATE_GENERATION=0
+CACHED_TIMELINE_REVISION=0
 
 CACHED_STREAM_CODEC="—"
 CACHED_STREAM_RATE=0
 CACHED_STREAM_BITS=0
 CACHED_STREAM_CHANNELS=0
 
-CACHED_PROGRESS_START=0
-CACHED_PROGRESS_CURRENT=0
-CACHED_PROGRESS_END=0
-CACHED_RTP_TIME=0
-
 LAST_ART_SIGNATURE=""
-LAST_META_SIGNATURE=""
+LAST_STATE_SIGNATURE=""
 LAST_RENDERED_QUALITY=""
 LAST_RENDERED_TITLE=""
 LAST_RENDERED_ARTIST=""
@@ -231,6 +232,7 @@ cleanup() {
     trap - EXIT INT TERM
 
     [[ -n "$UXPLAY_PID" ]] && kill "$UXPLAY_PID" 2>/dev/null || true
+    [[ -n "$PLAYBACK_PID" ]] && kill "$PLAYBACK_PID" 2>/dev/null || true
     [[ -n "$CAVA_PID" ]] && kill "$CAVA_PID" 2>/dev/null || true
 
     stop_discord_helper
@@ -271,35 +273,52 @@ print_centered() {
 
 get_file_signature() {
     local file="$1"
-    [[ -f "$file" ]] && stat -c '%Y:%s' "$file" 2>/dev/null || true
+    [[ -f "$file" ]] && stat -c '%i:%y:%s' "$file" 2>/dev/null || true
 }
 
-metadata_lines() {
-    [[ -s "$META_FILE" ]] || return
-    tr -d '\000' < "$META_FILE" 2>/dev/null \
-        | iconv -f UTF-8 -t UTF-8//IGNORE 2>/dev/null \
-        | sed '/^[[:space:]]*$/d'
-}
+update_playback_state_cache() {
+    [[ -s "$STATE_FILE" ]] || return 1
 
-read_metadata_value() {
-    local key="$1"
-    metadata_lines | awk -v key="$key" '
-        BEGIN { IGNORECASE=1 }
-        $0 ~ "^" key "[[:space:]]*:" {
-            sub("^[^:]*:[[:space:]]*", "")
-            print
-            exit
-        }
-    '
-}
+    local title artist album genre position duration playback_kind
+    local generation timeline_revision
 
-update_metadata_cache() {
-    # Treat each metadata update as a complete snapshot so absent fields
-    # clear values from the previous track.
-    CACHED_TITLE="$(read_metadata_value "Title")"
-    CACHED_ARTIST="$(read_metadata_value "Artist")"
-    CACHED_ALBUM="$(read_metadata_value "Album")"
-    CACHED_GENRE="$(read_metadata_value "Genre")"
+    # Read the entire NUL-delimited snapshot before changing any cached
+    # value. The producer publishes with an atomic rename, so the TUI and
+    # Discord always observe one complete content generation.
+    exec 5<"$STATE_FILE"
+    IFS= read -r -d '' title <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' artist <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' album <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' genre <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' position <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' duration <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' playback_kind <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' generation <&5 || { exec 5<&-; return 1; }
+    IFS= read -r -d '' timeline_revision <&5 || { exec 5<&-; return 1; }
+    exec 5<&-
+
+    [[ "$position" =~ ^[0-9]+$ ]] || return 1
+    [[ "$duration" =~ ^[0-9]+$ ]] || return 1
+    [[ "$generation" =~ ^[0-9]+$ ]] || return 1
+    [[ "$timeline_revision" =~ ^[0-9]+$ ]] || return 1
+    case "$playback_kind" in
+        pending|track|live) ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$generation" != "$CACHED_STATE_GENERATION" ]]; then
+        LAST_DISCORD_SIGNATURE=""
+    fi
+
+    CACHED_TITLE="$title"
+    CACHED_ARTIST="$artist"
+    CACHED_ALBUM="$album"
+    CACHED_GENRE="$genre"
+    CACHED_POSITION="$position"
+    CACHED_DURATION="$duration"
+    CACHED_PLAYBACK_KIND="$playback_kind"
+    CACHED_STATE_GENERATION="$generation"
+    CACHED_TIMELINE_REVISION="$timeline_revision"
 }
 
 update_device_cache() {
@@ -403,84 +422,12 @@ get_stream_quality() {
     printf '%s' "$quality"
 }
 
-update_progress_cache() {
-    [[ -s "$LOG_FILE" ]] || return
-    local progress_line start current end rtp_line rtp
-
-    progress_line="$(
-        tail -n 1500 "$LOG_FILE" 2>/dev/null \
-            | grep -a '^progress:' \
-            | tail -n 1
-    )"
-
-    if [[ "$progress_line" =~ ^progress:[[:space:]]*([0-9]+)/([0-9]+)/([0-9]+) ]]; then
-        start="${BASH_REMATCH[1]}"
-        current="${BASH_REMATCH[2]}"
-        end="${BASH_REMATCH[3]}"
-
-        if (( start > 0 && current >= start && end > start )); then
-            if (( start != CACHED_PROGRESS_START || end != CACHED_PROGRESS_END )); then
-                CACHED_RTP_TIME="$current"
-            fi
-            CACHED_PROGRESS_START="$start"
-            CACHED_PROGRESS_CURRENT="$current"
-            CACHED_PROGRESS_END="$end"
-        fi
-    fi
-
-    rtp_line="$(
-        tail -n 500 "$LOG_FILE" 2>/dev/null \
-            | grep -a 'rtp_time=' \
-            | tail -n 1
-    )"
-
-    if [[ "$rtp_line" =~ rtp_time=([0-9]+) ]]; then
-        rtp="${BASH_REMATCH[1]}"
-        if (( CACHED_PROGRESS_START > 0 &&
-              CACHED_PROGRESS_END > CACHED_PROGRESS_START &&
-              rtp >= CACHED_PROGRESS_START &&
-              rtp <= CACHED_PROGRESS_END )); then
-            CACHED_RTP_TIME="$rtp"
-        fi
-    fi
-}
-
-get_active_rtp_rate() {
-    if [[ "$CACHED_STREAM_RATE" =~ ^[0-9]+$ ]] && (( CACHED_STREAM_RATE > 0 )); then
-        printf '%s' "$CACHED_STREAM_RATE"
-    else
-        printf '%s' "$DEFAULT_RTP_RATE"
-    fi
-}
-
 get_duration_seconds() {
-    local rate
-    rate="$(get_active_rtp_rate)"
-    if (( CACHED_PROGRESS_START <= 0 || CACHED_PROGRESS_END <= CACHED_PROGRESS_START )); then
-        printf '0'
-        return
-    fi
-    printf '%d' $(((CACHED_PROGRESS_END - CACHED_PROGRESS_START) / rate))
+    printf '%s' "$CACHED_DURATION"
 }
 
 get_position_seconds() {
-    local rate current
-    rate="$(get_active_rtp_rate)"
-
-    if (( CACHED_PROGRESS_START <= 0 || CACHED_PROGRESS_END <= CACHED_PROGRESS_START )); then
-        printf '0'
-        return
-    fi
-
-    current="$CACHED_RTP_TIME"
-    if (( current < CACHED_PROGRESS_START || current > CACHED_PROGRESS_END )); then
-        current="$CACHED_PROGRESS_CURRENT"
-    fi
-
-    (( current < CACHED_PROGRESS_START )) && current="$CACHED_PROGRESS_START"
-    (( current > CACHED_PROGRESS_END )) && current="$CACHED_PROGRESS_END"
-
-    printf '%d' $(((current - CACHED_PROGRESS_START) / rate))
+    printf '%s' "$CACHED_POSITION"
 }
 
 rgb_to_ansi256() {
@@ -695,6 +642,19 @@ draw_progress_bar() {
     move_to "$PROGRESS_ROW" 1
     clear_line
 
+    if [[ "$CACHED_PLAYBACK_KIND" == "pending" ]]; then
+        LAST_RENDERED_PROGRESS_CURRENT=-3
+        LAST_RENDERED_PROGRESS_DURATION=-3
+        return
+    fi
+
+    if [[ "$CACHED_PLAYBACK_KIND" == "live" ]]; then
+        print_centered "$PROGRESS_ROW" "${PURPLE_BRIGHT}${BOLD}● LIVE${RESET}"
+        LAST_RENDERED_PROGRESS_CURRENT=-2
+        LAST_RENDERED_PROGRESS_DURATION=-2
+        return
+    fi
+
     if (( duration <= 0 )); then
         current_text="$(format_time "$current")"
         duration_text="--:--"
@@ -738,6 +698,21 @@ draw_progress_bar() {
 
 update_progress_display() {
     local current duration
+
+    if [[ "$CACHED_PLAYBACK_KIND" == "pending" ]]; then
+        if (( LAST_RENDERED_PROGRESS_DURATION != -3 )); then
+            draw_progress_bar 0 0
+        fi
+        return
+    fi
+
+    if [[ "$CACHED_PLAYBACK_KIND" == "live" ]]; then
+        if (( LAST_RENDERED_PROGRESS_DURATION != -2 )); then
+            draw_progress_bar 0 0
+        fi
+        return
+    fi
+
     current="$(get_position_seconds)"
     duration="$(get_duration_seconds)"
 
@@ -900,6 +875,16 @@ draw_screen() {
     draw_footer
 }
 
+python3 "$PLAYBACK_HELPER" \
+    --input-fifo "$UXPLAY_FIFO" \
+    --state-file "$STATE_FILE" \
+    --log-file "$LOG_FILE" \
+    </dev/null \
+    >/dev/null \
+    2>"$PLAYBACK_LOG_FILE" &
+
+PLAYBACK_PID=$!
+
 uxplay \
     -d \
     -async \
@@ -946,7 +931,6 @@ draw_visualizer_idle
 
 exec 3<>"$CAVA_FIFO"
 
-last_progress_check_ms=0
 last_quality_check_ms=0
 last_file_check_ms=0
 
@@ -956,7 +940,7 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
 
     if (( now_ms - last_file_check_ms >= FILE_CHECK_INTERVAL_MS )); then
         art_signature="$(get_file_signature "$ART_FILE")"
-        meta_signature="$(get_file_signature "$META_FILE")"
+        state_signature="$(get_file_signature "$STATE_FILE")"
 
         if [[ -n "$art_signature" && "$art_signature" != "$LAST_ART_SIGNATURE" ]]; then
             update_accent_from_artwork
@@ -1002,4 +986,20 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
     fi
 done
 
-wait "$UXPLAY_PID"
+playback_failed=0
+if kill -0 "$UXPLAY_PID" 2>/dev/null &&
+   ! kill -0 "$PLAYBACK_PID" 2>/dev/null; then
+    playback_failed=1
+    kill "$UXPLAY_PID" 2>/dev/null || true
+fi
+
+wait "$UXPLAY_PID" 2>/dev/null || true
+wait "$PLAYBACK_PID" 2>/dev/null || true
+
+if (( playback_failed )); then
+    cleanup
+    printf '%s\n' \
+        "Uka's playback-state engine stopped unexpectedly." \
+        "Diagnostic log: $PLAYBACK_LOG_FILE" >&2
+    exit 1
+fi

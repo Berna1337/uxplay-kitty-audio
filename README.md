@@ -14,6 +14,7 @@ album artwork, adaptive colors, playback metadata and Discord Rich Presence.
 - Album artwork rendered through Kitty's graphics protocol
 - Accent colors derived automatically from the current album artwork
 - Centered playback timeline with progress and duration
+- Automatic live-stream detection without a misleading fixed timeline
 - Negotiated stream information such as sample rate, bit depth, codec and channels
 - Real-time, sub-cell Cava audio visualizer at up to 60 FPS
 - Discord Rich Presence with track, artist, album, dynamic cover art and playback time
