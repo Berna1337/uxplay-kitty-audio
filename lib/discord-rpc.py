@@ -27,10 +27,9 @@ OP_FRAME = 1
 OP_CLOSE = 2
 OP_PING = 3
 OP_PONG = 4
-FIELD_COUNT = 6
+FIELD_COUNT = 5
 USER_AGENT = "Uka/1.0 (https://github.com/Berna1337/uxplay-kitty-audio)"
 ART_CACHE_VERSION = "v2"
-SPARSE_LIVE_CYCLE_INTERVAL = 10.0
 
 
 def encode_frame(opcode: int, payload: dict[str, Any]) -> bytes:
@@ -99,40 +98,18 @@ def lucene_phrase(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def is_generic_audio(
-    title: str,
-    artist: str,
-    album: str,
-    playback_kind: str = "track",
-) -> bool:
+def is_generic_audio(title: str, artist: str, album: str) -> bool:
     if not any(value.strip() for value in (title, artist, album)):
         return False
+    if not title.strip() or not artist.strip():
+        return True
     normalized_artist = normalized_match_text(artist)
-    if normalized_artist in {"radio", "vodafone tv"}:
+    normalized_album = normalized_match_text(album)
+    if not normalized_artist:
         return True
-    if playback_kind == "live":
+    if normalized_album and normalized_artist == normalized_album:
         return True
-    if playback_kind == "track" and artist.strip() and (
-        title.strip() or album.strip()
-    ):
-        return False
-    return not title.strip() or not artist.strip()
-
-
-def sparse_live_states(artist: str, album: str) -> list[str]:
-    states = ["LIVE · AirPlay audio"]
-    seen = {normalized_match_text(states[0])}
-    for value in (artist, album):
-        value = value.strip()
-        if not value:
-            continue
-        state = clean_text(f"LIVE · {value}", states[0])
-        key = normalized_match_text(state)
-        if not key or key in seen:
-            continue
-        states.append(state)
-        seen.add(key)
-    return states
+    return normalized_artist in {"radio", "vodafone tv"}
 
 
 class ArtworkLookup:
@@ -518,12 +495,8 @@ class ArtworkLookup:
             return artwork_url
 
         try:
-            deezer_result = (
-                self.deezer_art(
-                    artist, album, title, allow_alternative=False
-                )
-                if title.strip()
-                else None
+            deezer_result = self.deezer_art(
+                artist, album, title, allow_alternative=False
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
             deezer_result = None
@@ -552,12 +525,8 @@ class ArtworkLookup:
             return artwork_url
 
         try:
-            alternative_result = (
-                self.deezer_art(
-                    artist, album, title, allow_alternative=True
-                )
-                if title.strip()
-                else None
+            alternative_result = self.deezer_art(
+                artist, album, title, allow_alternative=True
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
             alternative_result = None
@@ -590,25 +559,19 @@ def build_activity(
     artwork: str,
     artwork_link: str = "",
     generic_audio: bool = False,
-    playback_kind: str = "track",
 ) -> dict[str, Any] | None:
-    if not any(value.strip() for value in (title, artist, album)):
+    if not title.strip() and not generic_audio:
         return None
 
     album_text = clean_text(album, "Uka")
-    if playback_kind == "live":
-        state = "LIVE · AirPlay audio"
-    elif generic_audio:
-        state = "AirPlay audio"
-    else:
-        state = clean_text(
-            f"by {artist}" if artist.strip() else album, "AirPlay audio"
-        )
+    state = (
+        "AirPlay audio"
+        if generic_audio
+        else clean_text(f"by {artist}" if artist.strip() else album, "AirPlay audio")
+    )
     activity: dict[str, Any] = {
         "type": 2,
-        "details": clean_text(
-            title, album_text if not generic_audio else "AirPlay audio"
-        ),
+        "details": clean_text(title, "AirPlay audio"),
         "state": state,
         "assets": {
             "large_image": artwork,
@@ -626,7 +589,7 @@ def build_activity(
         position_seconds = 0
         duration_seconds = 0
 
-    if duration_seconds > 0 and playback_kind == "track":
+    if duration_seconds > 0:
         position_seconds = min(position_seconds, duration_seconds)
         now = int(time.time())
         activity["timestamps"] = {
@@ -734,12 +697,9 @@ def run(
     input_buffer = bytearray()
     pending_fields: list[str] = []
     last_activity: dict[str, Any] | None = None
-    last_fields: tuple[str, str, str, str, str, str] | None = None
+    last_fields: tuple[str, str, str, str, str] | None = None
     next_artwork_retry = 0.0
     next_connection_check = 0.0
-    live_states: list[str] = []
-    live_state_index = 0
-    next_live_state_rotation = 0.0
     has_activity = False
     last_reported_error = ""
 
@@ -755,9 +715,9 @@ def run(
             last_reported_error = rpc.last_error
         next_connection_check = time.monotonic() + reconnect_interval
 
-    def resolve_and_publish(fields: tuple[str, str, str, str, str, str]) -> None:
+    def resolve_and_publish(fields: tuple[str, str, str, str, str]) -> None:
         nonlocal last_activity, next_artwork_retry
-        title, artist, album, position, duration, playback_kind = fields
+        title, artist, album, position, duration = fields
         resolved_artwork = artwork_lookup.resolve(artist, album, title)
         print(
             f"Artwork for {artist} — {album} — {title}: "
@@ -773,7 +733,6 @@ def run(
                 duration,
                 resolved_artwork,
                 artwork_lookup.last_link,
-                playback_kind=playback_kind,
             )
             publish(last_activity)
             next_artwork_retry = 0.0
@@ -789,15 +748,6 @@ def run(
             )
             if not readable:
                 now = time.monotonic()
-                if (
-                    len(live_states) > 1
-                    and last_activity is not None
-                    and now >= next_live_state_rotation
-                ):
-                    live_state_index = (live_state_index + 1) % len(live_states)
-                    last_activity["state"] = live_states[live_state_index]
-                    publish(last_activity)
-                    next_live_state_rotation = now + SPARSE_LIVE_CYCLE_INTERVAL
                 if has_activity and now >= next_connection_check:
                     if not rpc.connection_active():
                         publish(last_activity)
@@ -825,20 +775,11 @@ def run(
                 if len(pending_fields) != FIELD_COUNT:
                     continue
 
-                title, artist, album, position, duration, playback_kind = pending_fields
+                title, artist, album, position, duration = pending_fields
                 pending_fields = []
-                last_fields = (
-                    title,
-                    artist,
-                    album,
-                    position,
-                    duration,
-                    playback_kind,
-                )
+                last_fields = (title, artist, album, position, duration)
                 next_artwork_retry = 0.0
-                generic_audio = is_generic_audio(
-                    title, artist, album, playback_kind
-                )
+                generic_audio = is_generic_audio(title, artist, album)
                 if generic_audio:
                     artwork = generic_asset_key
                     artwork_link = ""
@@ -854,22 +795,7 @@ def run(
                     artwork,
                     artwork_link,
                     generic_audio,
-                    playback_kind,
                 )
-                if generic_audio and playback_kind == "live":
-                    live_states = sparse_live_states(artist, album)
-                    live_state_index = 0
-                    next_live_state_rotation = (
-                        time.monotonic() + SPARSE_LIVE_CYCLE_INTERVAL
-                        if len(live_states) > 1
-                        else 0.0
-                    )
-                    if last_activity is not None:
-                        last_activity["state"] = live_states[0]
-                else:
-                    live_states = []
-                    live_state_index = 0
-                    next_live_state_rotation = 0.0
                 has_activity = last_activity is not None
                 publish(last_activity)
 
@@ -900,42 +826,7 @@ def self_test(asset_key: str) -> int:
     assert is_generic_audio("Jornal da Meia-Noite S1", "", "Vodafone TV")
     assert is_generic_audio("Program", "Vodafone TV", "Vodafone TV")
     assert is_generic_audio("", "", "Vodafone TV")
-    assert is_generic_audio(
-        "Netflix - Neon Genesis Evangelion", "", "Netflix - S1:E16"
-    )
-    assert is_generic_audio("Live Channel", "Jankos", "Twitch", "live")
-    assert not is_generic_audio("", "Toranja", "Esquissos", "track")
     assert not is_generic_audio("Track", "Artist", "Album")
-    assert not is_generic_audio(
-        "Each Time You Fall in Love",
-        "Cigarettes After Sex",
-        "Cigarettes After Sex",
-    )
-    assert sparse_live_states("", "Vodafone TV") == [
-        "LIVE · AirPlay audio",
-        "LIVE · Vodafone TV",
-    ]
-    assert sparse_live_states("Vodafone TV", "Vodafone TV") == [
-        "LIVE · AirPlay audio",
-        "LIVE · Vodafone TV",
-    ]
-    assert sparse_live_states("Station", "Evening Broadcast") == [
-        "LIVE · AirPlay audio",
-        "LIVE · Station",
-        "LIVE · Evening Broadcast",
-    ]
-    titleless_music_activity = build_activity(
-        "",
-        "Toranja",
-        "Esquissos",
-        "138",
-        "259",
-        asset_key,
-    )
-    assert titleless_music_activity is not None
-    assert titleless_music_activity["details"] == "Esquissos"
-    assert titleless_music_activity["state"] == "by Toranja"
-    assert "timestamps" in titleless_music_activity
     generic_activity = build_activity(
         "Jornal da Meia-Noite S1",
         "",
@@ -950,19 +841,6 @@ def self_test(asset_key: str) -> int:
     assert generic_activity["assets"] == {
         "large_image": "uxplay-kitty-audio-sound"
     }
-    live_activity = build_activity(
-        "Live Channel",
-        "",
-        "Vodafone TV",
-        "204",
-        "290",
-        "uxplay-kitty-audio-sound",
-        generic_audio=True,
-        playback_kind="live",
-    )
-    assert live_activity is not None
-    assert live_activity["state"] == "LIVE · AirPlay audio"
-    assert "timestamps" not in live_activity
 
     client_socket, server_socket = socket.socketpair()
 

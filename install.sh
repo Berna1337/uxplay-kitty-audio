@@ -33,7 +33,6 @@ sed \
     > "$APP_DIR/uxplay-kitty-audio.desktop"
 chmod 644 "$APP_DIR/uxplay-kitty-audio.desktop"
 install -m 755 "$ROOT_DIR/lib/discord-rpc.py" "$LIB_DIR/discord-rpc.py"
-install -m 755 "$ROOT_DIR/lib/playback-state.py" "$LIB_DIR/playback-state.py"
 
 # Remove launcher files left by versions published under the old name.
 rm -f \

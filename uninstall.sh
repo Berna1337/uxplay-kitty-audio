@@ -16,7 +16,6 @@ rm -f \
 
 rm -f \
     "$DATA_DIR/uxplay-kitty-audio/discord-rpc.py" \
-    "$DATA_DIR/uxplay-kitty-audio/playback-state.py" \
     "$DATA_DIR/icons/hicolor/1024x1024/apps/uxplay-kitty-audio.png"
 
 rmdir "$DATA_DIR/uxplay-kitty-audio" 2>/dev/null || true

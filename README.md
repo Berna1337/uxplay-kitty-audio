@@ -3,7 +3,7 @@
 A friendly Kitty-native AirPlay audio visualizer for Linux, powered by UxPlay—with
 album artwork, adaptive colors, playback metadata and Discord Rich Presence.
 
-<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/80c846e5-50cc-4d75-9b51-36ba90e0c6e1" />
+<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/b02651c4-131b-4246-b03b-f2531bcfa8d6" />
 
 ## Features
 
@@ -18,7 +18,7 @@ album artwork, adaptive colors, playback metadata and Discord Rich Presence.
 - Negotiated stream information such as sample rate, bit depth, codec and channels
 - Real-time, sub-cell Cava audio visualizer at up to 60 FPS
 - Discord Rich Presence with track, artist, album, dynamic cover art and playback time
-- Ordered playback-state engine with atomic TUI and Discord updates
+- Cached playback values to reduce UI glitches
 - Dedicated Kitty desktop launcher
 
 ## Requirements
@@ -31,6 +31,7 @@ album artwork, adaptive colors, playback metadata and Discord Rich Presence.
 - PulseAudio tools (`pactl`) and a PulseAudio-compatible audio service
 - Python 3
 - Discord desktop client
+- `iconv`
 - standard GNU/Linux utilities (`awk`, `sed`, `grep`, `stat`, `tail`, `tput`)
 
 Uka intentionally runs only inside Kitty. When launched from another
@@ -88,11 +89,9 @@ setting between launches and enables Discord Rich Presence by default.
 ## How it works
 
 The project starts UxPlay in audio mode with debug logging, cover-art output and
-metadata output. A bundled playback-state engine consumes UxPlay's events in
-their original order and publishes one atomic snapshot containing the content
-identity, metadata, playback kind and timeline. Both the TUI and the bundled
-Discord RPC helper consume that same snapshot, so a source change cannot mix new
-metadata with timing left over from the previous source.
+metadata output. The TUI reads those outputs to render the current track and
+negotiated audio stream. A bundled Python helper publishes the same track
+information to the local Discord desktop client over Discord RPC.
 
 UxPlay remains the AirPlay receiver; this project is only a terminal frontend
 around its audio functionality.
@@ -102,14 +101,9 @@ around its audio functionality.
 The stream-quality line displays what UxPlay actually reports receiving. It does
 not infer Hi-Res or bit depth from the source track.
 
-Metadata is handled as UTF-8, terminal control characters are removed, and each
-metadata update is treated as a complete snapshot, preventing album or genre
-values from a previous track remaining on screen.
-
-Some UxPlay builds omit the decoded `Title` line for Apple Music single
-releases even though the title is present in AirPlay's raw `minm` field. Uka
-decodes that field directly and, when raw data is unavailable, can recover the
-release title from Apple Music's `Title - Single` album convention.
+Metadata is handled as UTF-8 and each metadata update is treated as a complete
+snapshot, preventing album/genre values from a previous track remaining on
+screen.
 
 Discord Rich Presence shares the current title, artist, album and playback timing
 with Discord while music is playing. Album covers are matched through MusicBrainz
@@ -125,29 +119,9 @@ seconds. Discord may be opened or restarted after Uka; the latest activity is
 published automatically as soon as its local RPC socket becomes available
 again.
 
-AirPlay content missing identifying metadata, along with recognized non-music
-sources such as television audio and radio programs, skips music-catalog lookup
-and uses the dedicated sound asset instead of the music fallback. A finite track
-with an artist and either a title or album is treated as music; this preserves
-music presentation when UxPlay advertises a title field but omits its decoded
-value. For sparse live content, Discord keeps the title in place and rotates its
-status every ten seconds between the live indicator and any available artist
-and album values; empty and duplicate values are skipped.
-
-Finite media is identified from the duration declared in its AirPlay metadata.
-UxPlay does not repeat that duration in every metadata event, so Uka remembers
-it by AirPlay's persistent content ID for later updates and replays. For unknown
-durationless content, Uka recognizes a live stream when its progress window
-rolls or rebases as one unit; a source that supplies no progress also settles to
-live instead of leaving the timeline blank. This avoids title, artist and
-provider-specific guesses. Uka replaces the progress bar with a `LIVE`
-indicator and omits playback timestamps from Discord Rich Presence.
-
-Title, artist, album, persistent content ID, declared duration and timing are
-owned by one ordered state machine. Every identity change starts a new content
-generation and invalidates the previous timeline before another snapshot can be
-published. Atomic file replacement then gives the TUI and Discord either the
-old generation or the new one, never a partially updated mixture.
+AirPlay content with sparse or repetitive metadata, such as television audio
+and radio programs, skips music-catalog lookup and uses the dedicated sound
+asset instead of the music fallback.
 
 ## License
 

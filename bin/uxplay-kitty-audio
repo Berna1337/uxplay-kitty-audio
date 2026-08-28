@@ -16,7 +16,6 @@ CAVA_FIFO="$CACHE_DIR/cava.fifo"
 DISCORD_FIFO="$CACHE_DIR/discord.fifo"
 DISCORD_LOG_FILE="$CACHE_DIR/discord-rpc.log"
 DISCORD_ART_CACHE="$CACHE_DIR/discord-art-cache.json"
-PLAYBACK_LOG_FILE="$CACHE_DIR/playback-state.log"
 
 DISCORD_CLIENT_ID="1542699590959104081"
 DISCORD_ASSET_KEY="uxplay-kitty-audio"
@@ -114,7 +113,7 @@ if [[ -z "${KITTY_WINDOW_ID:-}" && "${TERM:-}" != "xterm-kitty" ]]; then
     exit 1
 fi
 
-REQUIRED_COMMANDS=(uxplay cava magick pactl python3)
+REQUIRED_COMMANDS=(uxplay cava magick pactl iconv python3)
 MISSING_COMMANDS=()
 
 for required_command in "${REQUIRED_COMMANDS[@]}"; do
@@ -142,16 +141,13 @@ CAVA_SOURCE="${DEFAULT_SINK}.monitor"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/../lib/discord-rpc.py" ]]; then
     DISCORD_HELPER="$SCRIPT_DIR/../lib/discord-rpc.py"
-    PLAYBACK_HELPER="$SCRIPT_DIR/../lib/playback-state.py"
 else
     DISCORD_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/uxplay-kitty-audio/discord-rpc.py"
-    PLAYBACK_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/uxplay-kitty-audio/playback-state.py"
 fi
 
-if [[ ! -f "$DISCORD_HELPER" || ! -f "$PLAYBACK_HELPER" ]]; then
-    printf '%s\n' \
-        "Uka could not find its bundled Python helpers." \
-        "Reinstall Uka from the repository and try again." >&2
+if [[ ! -f "$DISCORD_HELPER" ]]; then
+    printf 'Uka could not find its Discord RPC helper: %s\n' \
+        "$DISCORD_HELPER" >&2
     exit 1
 fi
 
@@ -160,13 +156,10 @@ rm -f \
     "$ART_FILE" \
     "$META_FILE" \
     "$LOG_FILE" \
-    "$STATE_FILE" \
-    "$UXPLAY_FIFO" \
     "$CAVA_FIFO" \
     "$DISCORD_FIFO" \
-    "$DISCORD_LOG_FILE" \
-    "$PLAYBACK_LOG_FILE"
-mkfifo "$UXPLAY_FIFO" "$CAVA_FIFO" "$DISCORD_FIFO"
+    "$DISCORD_LOG_FILE"
+mkfifo "$CAVA_FIFO" "$DISCORD_FIFO"
 
 save_settings() {
     mkdir -p "$CONFIG_DIR"
@@ -205,7 +198,7 @@ stop_discord_helper() {
 
     if (( DISCORD_FD_OPEN )); then
         was_running=1
-        printf '\0\0\0\0\0\0' >&4 2>/dev/null || true
+        printf '\0\0\0\0\0' >&4 2>/dev/null || true
         exec 4>&-
         DISCORD_FD_OPEN=0
     fi
@@ -253,7 +246,7 @@ cleanup() {
 
     printf '\033[?25h'
     printf '\033[0m'
-    rm -f "$UXPLAY_FIFO" "$CAVA_FIFO" "$DISCORD_FIFO"
+    rm -f "$CAVA_FIFO" "$DISCORD_FIFO"
     clear
 }
 
@@ -731,33 +724,19 @@ update_progress_display() {
 update_discord_presence_if_needed() {
     (( DISCORD_FD_OPEN )) || return
 
-    local current duration playback_kind signature
-    if [[ "$CACHED_PLAYBACK_KIND" == "pending" ]]; then
-        current=0
-        duration=0
-        playback_kind="pending"
-        signature="${CACHED_STATE_GENERATION}|${CACHED_TITLE}|${CACHED_ARTIST}|${CACHED_ALBUM}|pending"
-    elif [[ "$CACHED_PLAYBACK_KIND" == "live" ]]; then
-        current=0
-        duration=0
-        playback_kind="live"
-        signature="${CACHED_STATE_GENERATION}|${CACHED_TITLE}|${CACHED_ARTIST}|${CACHED_ALBUM}|live"
-    else
-        current="$(get_position_seconds)"
-        duration="$(get_duration_seconds)"
-        playback_kind="track"
-        signature="${CACHED_STATE_GENERATION}|${CACHED_TIMELINE_REVISION}|track|${duration}"
-    fi
+    local current duration signature
+    current="$(get_position_seconds)"
+    duration="$(get_duration_seconds)"
+    signature="${CACHED_TITLE}|${CACHED_ARTIST}|${CACHED_ALBUM}|${duration}|${CACHED_PROGRESS_START}|${CACHED_PROGRESS_END}"
 
     [[ "$signature" == "$LAST_DISCORD_SIGNATURE" ]] && return
 
-    printf '%s\0%s\0%s\0%s\0%s\0%s\0' \
+    printf '%s\0%s\0%s\0%s\0%s\0' \
         "$CACHED_TITLE" \
         "$CACHED_ARTIST" \
         "$CACHED_ALBUM" \
         "$current" \
         "$duration" \
-        "$playback_kind" \
         >&4 2>/dev/null || true
 
     LAST_DISCORD_SIGNATURE="$signature"
@@ -912,7 +891,7 @@ uxplay \
     -ca "$ART_FILE" \
     -md "$META_FILE" \
     </dev/null \
-    >"$UXPLAY_FIFO" 2>&1 &
+    >"$LOG_FILE" 2>&1 &
 
 UXPLAY_PID=$!
 
@@ -955,8 +934,7 @@ exec 3<>"$CAVA_FIFO"
 last_quality_check_ms=0
 last_file_check_ms=0
 
-while kill -0 "$UXPLAY_PID" 2>/dev/null &&
-      kill -0 "$PLAYBACK_PID" 2>/dev/null; do
+while kill -0 "$UXPLAY_PID" 2>/dev/null; do
     handle_keyboard_input
     now_ms="$(get_time_ms)"
 
@@ -978,18 +956,21 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null &&
             LAST_ART_SIGNATURE="$art_signature"
         fi
 
-        if [[ -n "$state_signature" && "$state_signature" != "$LAST_STATE_SIGNATURE" ]]; then
-            if update_playback_state_cache; then
-                (( MENU_OPEN )) || update_metadata_if_needed
-                if (( ! MENU_OPEN )); then
-                    update_progress_display
-                fi
-                update_discord_presence_if_needed
-                LAST_STATE_SIGNATURE="$state_signature"
-            fi
+        if [[ -n "$meta_signature" && "$meta_signature" != "$LAST_META_SIGNATURE" ]]; then
+            update_metadata_cache
+            (( MENU_OPEN )) || update_metadata_if_needed
+            update_discord_presence_if_needed
+            LAST_META_SIGNATURE="$meta_signature"
         fi
 
         last_file_check_ms="$now_ms"
+    fi
+
+    if (( now_ms - last_progress_check_ms >= PROGRESS_INTERVAL_MS )); then
+        update_progress_cache
+        (( MENU_OPEN )) || update_progress_display
+        update_discord_presence_if_needed
+        last_progress_check_ms="$now_ms"
     fi
 
     if (( now_ms - last_quality_check_ms >= QUALITY_INTERVAL_MS )); then
