@@ -1,10 +1,13 @@
 [Desktop Entry]
 Type=Application
-Name=UxPlay Kitty Audio
-Comment=Kitty-native AirPlay audio receiver powered by UxPlay
+Name=Uka
+GenericName=AirPlay Audio Visualizer
+Comment=Kitty-native AirPlay audio visualizer powered by UxPlay
 TryExec=kitty
-Exec=kitty --class uxplay-kitty-audio --title "UxPlay Kitty Audio" uxplay-kitty-audio
-Icon=audio-speakers
+Exec=kitty --class uxplay-kitty-audio --title "Uka" uxplay-kitty-audio
+Icon=uxplay-kitty-audio
 Terminal=false
 Categories=AudioVideo;Audio;
+Keywords=AirPlay;audio;music;receiver;visualizer;
+StartupWMClass=uxplay-kitty-audio
 StartupNotify=true

@@ -4,11 +4,21 @@ set -u
 
 APP_NAME="uxplay-kitty-audio"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP_NAME"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP_NAME"
+SETTINGS_FILE="$CONFIG_DIR/settings.conf"
 ART_FILE="$CACHE_DIR/cover.jpg"
 META_FILE="$CACHE_DIR/metadata.txt"
 LOG_FILE="$CACHE_DIR/uxplay.log"
 CAVA_CONFIG="$CACHE_DIR/cava.conf"
 CAVA_FIFO="$CACHE_DIR/cava.fifo"
+DISCORD_FIFO="$CACHE_DIR/discord.fifo"
+DISCORD_LOG_FILE="$CACHE_DIR/discord-rpc.log"
+DISCORD_ART_CACHE="$CACHE_DIR/discord-art-cache.json"
+
+DISCORD_CLIENT_ID="1542699590959104081"
+DISCORD_ASSET_KEY="uxplay-kitty-audio"
+DISCORD_GENERIC_ASSET_KEY="uxplay-kitty-audio-sound"
+DISCORD_RECONNECT_INTERVAL=5
 
 VISUALIZER_FPS=60
 PROGRESS_INTERVAL_MS=200
@@ -40,6 +50,11 @@ RESET='\033[0m'
 
 UXPLAY_PID=""
 CAVA_PID=""
+DISCORD_PID=""
+DISCORD_FD_OPEN=0
+DISCORD_ENABLED=1
+MENU_OPEN=0
+TERMINAL_STATE=""
 
 CACHED_TITLE=""
 CACHED_ARTIST=""
@@ -67,6 +82,15 @@ LAST_RENDERED_GENRE=""
 LAST_RENDERED_DEVICE=""
 LAST_RENDERED_PROGRESS_CURRENT=-1
 LAST_RENDERED_PROGRESS_DURATION=-1
+LAST_DISCORD_SIGNATURE=""
+
+if [[ -f "$SETTINGS_FILE" ]]; then
+    while IFS='=' read -r setting value; do
+        if [[ "$setting" == "discord" && "$value" == "off" ]]; then
+            DISCORD_ENABLED=0
+        fi
+    done < "$SETTINGS_FILE"
+fi
 
 if command -v kitten >/dev/null 2>&1; then
     KITTEN_BIN="$(command -v kitten)"
@@ -74,21 +98,21 @@ elif [[ -x "$HOME/.local/kitty.app/bin/kitten" ]]; then
     KITTEN_BIN="$HOME/.local/kitty.app/bin/kitten"
 else
     printf '%s\n' \
-        "uxplay-kitty-audio requires Kitty and its kitten helper." \
-        "Install Kitty, then launch uxplay-kitty-audio from a Kitty terminal." \
+        "Uka requires Kitty and its kitten helper." \
+        "Install Kitty, then launch Uka with: uxplay-kitty-audio" \
         "https://sw.kovidgoyal.net/kitty/" >&2
     exit 1
 fi
 
 if [[ -z "${KITTY_WINDOW_ID:-}" && "${TERM:-}" != "xterm-kitty" ]]; then
     printf '%s\n' \
-        "uxplay-kitty-audio is a Kitty-native application." \
+        "Uka is a Kitty-native application." \
         "Please launch it from a Kitty terminal." \
         "https://sw.kovidgoyal.net/kitty/" >&2
     exit 1
 fi
 
-REQUIRED_COMMANDS=(uxplay cava magick pactl iconv)
+REQUIRED_COMMANDS=(uxplay cava magick pactl iconv python3)
 MISSING_COMMANDS=()
 
 for required_command in "${REQUIRED_COMMANDS[@]}"; do
@@ -97,25 +121,111 @@ for required_command in "${REQUIRED_COMMANDS[@]}"; do
 done
 
 if (( ${#MISSING_COMMANDS[@]} > 0 )); then
-    printf 'uxplay-kitty-audio is missing required commands: %s\n' \
+    printf 'Uka is missing required commands: %s\n' \
         "${MISSING_COMMANDS[*]}" >&2
     printf '%s\n' \
-        "Install the complete dependency set before launching uxplay-kitty-audio." >&2
+        "Install the complete dependency set before launching Uka." >&2
     exit 1
 fi
 
 DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || true)"
 if [[ -z "$DEFAULT_SINK" ]]; then
     printf '%s\n' \
-        "uxplay-kitty-audio could not determine the default audio sink." \
+        "Uka could not determine the default audio sink." \
         "Make sure your PulseAudio-compatible audio service is running." >&2
     exit 1
 fi
 CAVA_SOURCE="${DEFAULT_SINK}.monitor"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/../lib/discord-rpc.py" ]]; then
+    DISCORD_HELPER="$SCRIPT_DIR/../lib/discord-rpc.py"
+else
+    DISCORD_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/uxplay-kitty-audio/discord-rpc.py"
+fi
+
+if [[ ! -f "$DISCORD_HELPER" ]]; then
+    printf 'Uka could not find its Discord RPC helper: %s\n' \
+        "$DISCORD_HELPER" >&2
+    exit 1
+fi
+
 mkdir -p "$CACHE_DIR"
-rm -f "$ART_FILE" "$META_FILE" "$LOG_FILE" "$CAVA_FIFO"
-mkfifo "$CAVA_FIFO"
+rm -f \
+    "$ART_FILE" \
+    "$META_FILE" \
+    "$LOG_FILE" \
+    "$CAVA_FIFO" \
+    "$DISCORD_FIFO" \
+    "$DISCORD_LOG_FILE"
+mkfifo "$CAVA_FIFO" "$DISCORD_FIFO"
+
+save_settings() {
+    mkdir -p "$CONFIG_DIR"
+    if (( DISCORD_ENABLED )); then
+        printf '%s\n' 'discord=on' > "$SETTINGS_FILE"
+    else
+        printf '%s\n' 'discord=off' > "$SETTINGS_FILE"
+    fi
+}
+
+start_discord_helper() {
+    (( DISCORD_ENABLED )) || return
+    if [[ -n "$DISCORD_PID" ]] && kill -0 "$DISCORD_PID" 2>/dev/null; then
+        return
+    fi
+
+    exec 4<>"$DISCORD_FIFO"
+    DISCORD_FD_OPEN=1
+    python3 "$DISCORD_HELPER" \
+        --client-id "$DISCORD_CLIENT_ID" \
+        --asset-key "$DISCORD_ASSET_KEY" \
+        --generic-asset-key "$DISCORD_GENERIC_ASSET_KEY" \
+        --reconnect-interval "$DISCORD_RECONNECT_INTERVAL" \
+        --art-cache "$DISCORD_ART_CACHE" \
+        --pid "$$" \
+        <"$DISCORD_FIFO" \
+        4>&- \
+        >/dev/null \
+        2>>"$DISCORD_LOG_FILE" &
+    DISCORD_PID=$!
+    LAST_DISCORD_SIGNATURE=""
+}
+
+stop_discord_helper() {
+    local was_running=0 attempt
+
+    if (( DISCORD_FD_OPEN )); then
+        was_running=1
+        printf '\0\0\0\0\0' >&4 2>/dev/null || true
+        exec 4>&-
+        DISCORD_FD_OPEN=0
+    fi
+
+    if [[ -n "$DISCORD_PID" ]]; then
+        was_running=1
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            kill -0 "$DISCORD_PID" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$DISCORD_PID" 2>/dev/null; then
+            kill "$DISCORD_PID" 2>/dev/null || true
+        fi
+        wait "$DISCORD_PID" 2>/dev/null || true
+        DISCORD_PID=""
+    fi
+
+    if (( was_running )); then
+        python3 "$DISCORD_HELPER" \
+            --client-id "$DISCORD_CLIENT_ID" \
+            --asset-key "$DISCORD_ASSET_KEY" \
+            --pid "$$" \
+            --clear \
+            >/dev/null \
+            2>>"$DISCORD_LOG_FILE" || true
+    fi
+    LAST_DISCORD_SIGNATURE=""
+}
 
 cleanup() {
     trap - EXIT INT TERM
@@ -123,11 +233,18 @@ cleanup() {
     [[ -n "$UXPLAY_PID" ]] && kill "$UXPLAY_PID" 2>/dev/null || true
     [[ -n "$CAVA_PID" ]] && kill "$CAVA_PID" 2>/dev/null || true
 
+    stop_discord_helper
+
+    if [[ -n "$TERMINAL_STATE" ]]; then
+        stty "$TERMINAL_STATE" 2>/dev/null || true
+        TERMINAL_STATE=""
+    fi
+
     "$KITTEN_BIN" icat --clear 2>/dev/null || true
 
     printf '\033[?25h'
     printf '\033[0m'
-    rm -f "$CAVA_FIFO"
+    rm -f "$CAVA_FIFO" "$DISCORD_FIFO"
     clear
 }
 
@@ -475,7 +592,7 @@ update_accent_from_artwork() {
 draw_header() {
     local quality
     quality="$(get_stream_quality)"
-    print_centered 1 "${PURPLE_BRIGHT}${BOLD}AirPlay${RESET}"
+    print_centered 1 "${PURPLE_BRIGHT}${BOLD}Uka${RESET}"
     print_centered 2 "${PURPLE}────────────────────────────────${RESET}"
     print_centered 3 "${GREY}${quality}${RESET}"
     LAST_RENDERED_QUALITY="$quality"
@@ -629,6 +746,27 @@ update_progress_display() {
     fi
 }
 
+update_discord_presence_if_needed() {
+    (( DISCORD_FD_OPEN )) || return
+
+    local current duration signature
+    current="$(get_position_seconds)"
+    duration="$(get_duration_seconds)"
+    signature="${CACHED_TITLE}|${CACHED_ARTIST}|${CACHED_ALBUM}|${duration}|${CACHED_PROGRESS_START}|${CACHED_PROGRESS_END}"
+
+    [[ "$signature" == "$LAST_DISCORD_SIGNATURE" ]] && return
+
+    printf '%s\0%s\0%s\0%s\0%s\0' \
+        "$CACHED_TITLE" \
+        "$CACHED_ARTIST" \
+        "$CACHED_ALBUM" \
+        "$current" \
+        "$duration" \
+        >&4 2>/dev/null || true
+
+    LAST_DISCORD_SIGNATURE="$signature"
+}
+
 draw_visualizer_frame() {
     local data="$1"
     local cols max_bars count bar_count spectrum_width spectrum_col
@@ -698,6 +836,60 @@ draw_footer() {
     print_centered "$(terminal_height)" "${GREY}Ctrl+C to quit${RESET}"
 }
 
+draw_settings_menu() {
+    local status color
+    if (( DISCORD_ENABLED )); then
+        status="On"
+        color="$PURPLE_BRIGHT"
+    else
+        status="Off"
+        color="$GREY"
+    fi
+
+    clear
+    print_centered 7 "${PURPLE_BRIGHT}${BOLD}Uka Settings${RESET}"
+    print_centered 8 "${PURPLE}────────────────────────────────${RESET}"
+    print_centered 12 "${WHITE}${BOLD}Discord Rich Presence${RESET}  ${color}[ ${status} ]${RESET}"
+    print_centered 16 "${GREY}Enter or Space to toggle${RESET}"
+    print_centered 17 "${GREY}M or Esc to close${RESET}"
+}
+
+close_settings_menu() {
+    MENU_OPEN=0
+    draw_screen
+    draw_visualizer_idle
+}
+
+toggle_discord_setting() {
+    if (( DISCORD_ENABLED )); then
+        DISCORD_ENABLED=0
+        stop_discord_helper
+    else
+        DISCORD_ENABLED=1
+        start_discord_helper
+        update_discord_presence_if_needed
+    fi
+    save_settings
+    draw_settings_menu
+}
+
+handle_keyboard_input() {
+    local key
+    if ! IFS= read -rn1 -t 0.001 key; then
+        return
+    fi
+
+    if (( MENU_OPEN )); then
+        case "$key" in
+            ""|" ") toggle_discord_setting ;;
+            m|M|$'\e') close_settings_menu ;;
+        esac
+    elif [[ "$key" == "m" || "$key" == "M" ]]; then
+        MENU_OPEN=1
+        draw_settings_menu
+    fi
+}
+
 draw_screen() {
     clear
     draw_header
@@ -713,9 +905,12 @@ uxplay \
     -async \
     -ca "$ART_FILE" \
     -md "$META_FILE" \
+    </dev/null \
     >"$LOG_FILE" 2>&1 &
 
 UXPLAY_PID=$!
+
+start_discord_helper
 
 cat > "$CAVA_CONFIG" <<EOF
 [general]
@@ -737,8 +932,13 @@ channels = mono
 noise_reduction = 40
 EOF
 
-cava -p "$CAVA_CONFIG" >/dev/null 2>&1 &
+cava -p "$CAVA_CONFIG" </dev/null >/dev/null 2>&1 &
 CAVA_PID=$!
+
+if [[ -t 0 ]]; then
+    TERMINAL_STATE="$(stty -g)"
+    stty -echo -icanon min 0 time 0
+fi
 
 hide_cursor
 draw_screen
@@ -751,6 +951,7 @@ last_quality_check_ms=0
 last_file_check_ms=0
 
 while kill -0 "$UXPLAY_PID" 2>/dev/null; do
+    handle_keyboard_input
     now_ms="$(get_time_ms)"
 
     if (( now_ms - last_file_check_ms >= FILE_CHECK_INTERVAL_MS )); then
@@ -759,19 +960,22 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
 
         if [[ -n "$art_signature" && "$art_signature" != "$LAST_ART_SIGNATURE" ]]; then
             update_accent_from_artwork
-            draw_header
-            draw_album_art
-            draw_metadata
-            draw_device
-            LAST_RENDERED_PROGRESS_CURRENT=-1
-            LAST_RENDERED_PROGRESS_DURATION=-1
-            update_progress_display
+            if (( ! MENU_OPEN )); then
+                draw_header
+                draw_album_art
+                draw_metadata
+                draw_device
+                LAST_RENDERED_PROGRESS_CURRENT=-1
+                LAST_RENDERED_PROGRESS_DURATION=-1
+                update_progress_display
+            fi
             LAST_ART_SIGNATURE="$art_signature"
         fi
 
         if [[ -n "$meta_signature" && "$meta_signature" != "$LAST_META_SIGNATURE" ]]; then
             update_metadata_cache
-            update_metadata_if_needed
+            (( MENU_OPEN )) || update_metadata_if_needed
+            update_discord_presence_if_needed
             LAST_META_SIGNATURE="$meta_signature"
         fi
 
@@ -780,20 +984,21 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
 
     if (( now_ms - last_progress_check_ms >= PROGRESS_INTERVAL_MS )); then
         update_progress_cache
-        update_progress_display
+        (( MENU_OPEN )) || update_progress_display
+        update_discord_presence_if_needed
         last_progress_check_ms="$now_ms"
     fi
 
     if (( now_ms - last_quality_check_ms >= QUALITY_INTERVAL_MS )); then
         update_stream_format_cache
-        update_header_if_needed
+        (( MENU_OPEN )) || update_header_if_needed
         update_device_cache
-        update_device_if_needed
+        (( MENU_OPEN )) || update_device_if_needed
         last_quality_check_ms="$now_ms"
     fi
 
     if IFS= read -r -t 0.02 cava_data <&3; then
-        draw_visualizer_frame "$cava_data"
+        (( MENU_OPEN )) || draw_visualizer_frame "$cava_data"
     fi
 done
 
