@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-rm -f "$HOME/.local/bin/uxplay-audio-tui"
-rm -f "$HOME/.local/share/applications/airplay-audio.desktop"
-rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/uxplay-audio-tui"
+rm -f \
+    "$HOME/.local/bin/uxplay-kitty-audio" \
+    "$HOME/.local/bin/uxplay-kitty" \
+    "$HOME/.local/bin/uxplay-audio-tui"
+
+rm -f \
+    "$HOME/.local/share/applications/uxplay-kitty-audio.desktop" \
+    "$HOME/.local/share/applications/uxplay-kitty.desktop" \
+    "$HOME/.local/share/applications/airplay-audio.desktop"
+
+rm -rf \
+    "${XDG_CACHE_HOME:-$HOME/.cache}/uxplay-kitty-audio" \
+    "${XDG_CACHE_HOME:-$HOME/.cache}/uxplay-kitty" \
+    "${XDG_CACHE_HOME:-$HOME/.cache}/uxplay-audio-tui"
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
-echo "UxPlay Audio TUI removed."
+echo "UxPlay Kitty Audio removed."

@@ -2,7 +2,7 @@
 
 set -u
 
-APP_NAME="uxplay-audio-tui"
+APP_NAME="uxplay-kitty-audio"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP_NAME"
 ART_FILE="$CACHE_DIR/cover.jpg"
 META_FILE="$CACHE_DIR/metadata.txt"
@@ -25,9 +25,13 @@ INFO_ROW=6
 PROGRESS_ROW=25
 VISUALIZER_ROW=28
 VISUALIZER_HEIGHT=7
+VISUALIZER_GAIN=150
+CAVA_MAX_RANGE=100
 
-PURPLE='\033[38;5;141m'
-PURPLE_BRIGHT='\033[38;5;177m'
+ACCENT_INDEX=141
+ACCENT_BRIGHT_INDEX=177
+PURPLE="\033[38;5;${ACCENT_INDEX}m"
+PURPLE_BRIGHT="\033[38;5;${ACCENT_BRIGHT_INDEX}m"
 WHITE='\033[97m'
 GREY='\033[38;5;245m'
 DIM='\033[2m'
@@ -41,6 +45,7 @@ CACHED_TITLE=""
 CACHED_ARTIST=""
 CACHED_ALBUM=""
 CACHED_GENRE=""
+CACHED_DEVICE=""
 
 CACHED_STREAM_CODEC="—"
 CACHED_STREAM_RATE=0
@@ -59,34 +64,58 @@ LAST_RENDERED_TITLE=""
 LAST_RENDERED_ARTIST=""
 LAST_RENDERED_ALBUM=""
 LAST_RENDERED_GENRE=""
+LAST_RENDERED_DEVICE=""
 LAST_RENDERED_PROGRESS_CURRENT=-1
 LAST_RENDERED_PROGRESS_DURATION=-1
 
-mkdir -p "$CACHE_DIR"
-rm -f "$ART_FILE" "$META_FILE" "$LOG_FILE" "$CAVA_FIFO"
-mkfifo "$CAVA_FIFO"
-
-if ! command -v uxplay >/dev/null 2>&1; then
-    echo "Error: uxplay was not found in PATH." >&2
-    exit 1
-fi
-
-# Inline artwork currently uses the Kitty graphics protocol.
-# If unavailable, the rest of the TUI continues to work.
 if command -v kitten >/dev/null 2>&1; then
     KITTEN_BIN="$(command -v kitten)"
 elif [[ -x "$HOME/.local/kitty.app/bin/kitten" ]]; then
     KITTEN_BIN="$HOME/.local/kitty.app/bin/kitten"
 else
-    KITTEN_BIN=""
+    printf '%s\n' \
+        "uxplay-kitty-audio requires Kitty and its kitten helper." \
+        "Install Kitty, then launch uxplay-kitty-audio from a Kitty terminal." \
+        "https://sw.kovidgoyal.net/kitty/" >&2
+    exit 1
 fi
 
-supports_kitty_graphics() {
-    [[ -n "$KITTEN_BIN" ]] || return 1
-    [[ -n "${KITTY_WINDOW_ID:-}" ]] && return 0
-    [[ "${TERM:-}" == "xterm-kitty" ]] && return 0
-    return 1
-}
+if [[ -z "${KITTY_WINDOW_ID:-}" && "${TERM:-}" != "xterm-kitty" ]]; then
+    printf '%s\n' \
+        "uxplay-kitty-audio is a Kitty-native application." \
+        "Please launch it from a Kitty terminal." \
+        "https://sw.kovidgoyal.net/kitty/" >&2
+    exit 1
+fi
+
+REQUIRED_COMMANDS=(uxplay cava magick pactl iconv)
+MISSING_COMMANDS=()
+
+for required_command in "${REQUIRED_COMMANDS[@]}"; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || MISSING_COMMANDS+=("$required_command")
+done
+
+if (( ${#MISSING_COMMANDS[@]} > 0 )); then
+    printf 'uxplay-kitty-audio is missing required commands: %s\n' \
+        "${MISSING_COMMANDS[*]}" >&2
+    printf '%s\n' \
+        "Install the complete dependency set before launching uxplay-kitty-audio." >&2
+    exit 1
+fi
+
+DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || true)"
+if [[ -z "$DEFAULT_SINK" ]]; then
+    printf '%s\n' \
+        "uxplay-kitty-audio could not determine the default audio sink." \
+        "Make sure your PulseAudio-compatible audio service is running." >&2
+    exit 1
+fi
+CAVA_SOURCE="${DEFAULT_SINK}.monitor"
+
+mkdir -p "$CACHE_DIR"
+rm -f "$ART_FILE" "$META_FILE" "$LOG_FILE" "$CAVA_FIFO"
+mkfifo "$CAVA_FIFO"
 
 cleanup() {
     trap - EXIT INT TERM
@@ -94,9 +123,7 @@ cleanup() {
     [[ -n "$UXPLAY_PID" ]] && kill "$UXPLAY_PID" 2>/dev/null || true
     [[ -n "$CAVA_PID" ]] && kill "$CAVA_PID" 2>/dev/null || true
 
-    if supports_kitty_graphics; then
-        "$KITTEN_BIN" icat --clear 2>/dev/null || true
-    fi
+    "$KITTEN_BIN" icat --clear 2>/dev/null || true
 
     printf '\033[?25h'
     printf '\033[0m'
@@ -156,6 +183,24 @@ update_metadata_cache() {
     CACHED_ARTIST="$(read_metadata_value "Artist")"
     CACHED_ALBUM="$(read_metadata_value "Album")"
     CACHED_GENRE="$(read_metadata_value "Genre")"
+}
+
+update_device_cache() {
+    [[ -s "$LOG_FILE" ]] || return
+    local line device
+    local device_regex='connection request from ([^ ]+)'
+
+    line="$(
+        tail -n 2000 "$LOG_FILE" 2>/dev/null \
+            | grep -a 'connection request from ' \
+            | tail -n 1
+    )"
+    [[ -n "$line" ]] || return
+
+    if [[ "$line" =~ $device_regex ]]; then
+        device="${BASH_REMATCH[1]}"
+        [[ -n "$device" ]] && CACHED_DEVICE="$device"
+    fi
 }
 
 update_stream_format_cache() {
@@ -321,6 +366,112 @@ get_position_seconds() {
     printf '%d' $(((current - CACHED_PROGRESS_START) / rate))
 }
 
+rgb_to_ansi256() {
+    local r="$1" g="$2" b="$3"
+    local ri gi bi
+    ri=$((r * 5 / 255))
+    gi=$((g * 5 / 255))
+    bi=$((b * 5 / 255))
+    printf '%d' $((16 + 36 * ri + 6 * gi + bi))
+}
+
+brighten_channel() {
+    local value="$1"
+    value=$((value + (255 - value) * 30 / 100))
+    (( value > 255 )) && value=255
+    printf '%d' "$value"
+}
+
+update_accent_from_artwork() {
+    [[ -s "$ART_FILE" ]] || return
+
+    local hex r g b bright_r bright_g bright_b accent bright_accent
+    local max_channel scale
+
+    # Give UxPlay a moment to finish writing the new cover, then choose a
+    # saturated, visible color rather than simply the most common one.
+    sleep 0.05
+    hex="$(
+        magick "$ART_FILE" \
+            -alpha off \
+            -resize 120x120 \
+            -colors 24 \
+            -format '%c' histogram:info: \
+            2>/dev/null \
+        | awk '
+            function hex_digit(c) {
+                c = tolower(c)
+                return index("0123456789abcdef", c) - 1
+            }
+            function hex_byte(s) {
+                return hex_digit(substr(s, 1, 1)) * 16 + hex_digit(substr(s, 2, 1))
+            }
+            match($0, /#[0-9A-Fa-f]{6}/) {
+                hex = substr($0, RSTART + 1, 6)
+                r = hex_byte(substr(hex, 1, 2))
+                g = hex_byte(substr(hex, 3, 2))
+                b = hex_byte(substr(hex, 5, 2))
+
+                max = r
+                if (g > max) max = g
+                if (b > max) max = b
+                min = r
+                if (g < min) min = g
+                if (b < min) min = b
+
+                saturation = max - min
+                brightness = (r + g + b) / 3
+                score = saturation * 2 + brightness
+                if (brightness < 30) score -= 200
+                if (brightness > 235 && saturation < 20) score -= 100
+
+                if (!found || score > best_score) {
+                    found = 1
+                    best_score = score
+                    best_hex = hex
+                }
+            }
+            END { if (found) print "#" best_hex }
+        '
+    )"
+
+    if [[ ! "$hex" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
+        ACCENT_INDEX=141
+        ACCENT_BRIGHT_INDEX=177
+        PURPLE="\033[38;5;${ACCENT_INDEX}m"
+        PURPLE_BRIGHT="\033[38;5;${ACCENT_BRIGHT_INDEX}m"
+        return
+    fi
+
+    r=$((16#${hex:1:2}))
+    g=$((16#${hex:3:2}))
+    b=$((16#${hex:5:2}))
+
+    max_channel="$r"
+    (( g > max_channel )) && max_channel="$g"
+    (( b > max_channel )) && max_channel="$b"
+    if (( max_channel < 140 && max_channel > 0 )); then
+        scale=$((140 * 100 / max_channel))
+        r=$((r * scale / 100))
+        g=$((g * scale / 100))
+        b=$((b * scale / 100))
+        (( r > 255 )) && r=255
+        (( g > 255 )) && g=255
+        (( b > 255 )) && b=255
+    fi
+
+    accent="$(rgb_to_ansi256 "$r" "$g" "$b")"
+    bright_r="$(brighten_channel "$r")"
+    bright_g="$(brighten_channel "$g")"
+    bright_b="$(brighten_channel "$b")"
+    bright_accent="$(rgb_to_ansi256 "$bright_r" "$bright_g" "$bright_b")"
+
+    ACCENT_INDEX="$accent"
+    ACCENT_BRIGHT_INDEX="$bright_accent"
+    PURPLE="\033[38;5;${ACCENT_INDEX}m"
+    PURPLE_BRIGHT="\033[38;5;${ACCENT_BRIGHT_INDEX}m"
+}
+
 draw_header() {
     local quality
     quality="$(get_stream_quality)"
@@ -337,24 +488,19 @@ update_header_if_needed() {
 }
 
 draw_album_art() {
-    if supports_kitty_graphics; then
-        "$KITTEN_BIN" icat --clear 2>/dev/null || true
-        if [[ -s "$ART_FILE" ]]; then
-            "$KITTEN_BIN" icat \
-                --align left \
-                --place "${ART_WIDTH}x${ART_HEIGHT}@${ART_COL}x${ART_ROW}" \
-                "$ART_FILE" 2>/dev/null || true
-            return
-        fi
+    "$KITTEN_BIN" icat --clear 2>/dev/null || true
+
+    if [[ -s "$ART_FILE" ]]; then
+        "$KITTEN_BIN" icat \
+            --align left \
+            --place "${ART_WIDTH}x${ART_HEIGHT}@${ART_COL}x${ART_ROW}" \
+            "$ART_FILE" 2>/dev/null || true
+        return
     fi
 
     move_to 13 7
     clear_line
-    if [[ -s "$ART_FILE" ]]; then
-        printf "${GREY}Artwork saved; inline images unsupported here.${RESET}"
-    else
-        printf "${GREY}Waiting for artwork...${RESET}"
-    fi
+    printf "${GREY}Waiting for artwork...${RESET}"
 }
 
 print_field() {
@@ -378,14 +524,25 @@ draw_metadata() {
     print_field "$((INFO_ROW + 8))" "ALBUM" "$CACHED_ALBUM"
     print_field "$((INFO_ROW + 12))" "GENRE" "$CACHED_GENRE"
 
-    move_to "$((INFO_ROW + 16))" "$INFO_COL"
-    clear_line
-    printf "${PURPLE}●${RESET} ${GREY}AirPlay audio active${RESET}"
-
     LAST_RENDERED_TITLE="$CACHED_TITLE"
     LAST_RENDERED_ARTIST="$CACHED_ARTIST"
     LAST_RENDERED_ALBUM="$CACHED_ALBUM"
     LAST_RENDERED_GENRE="$CACHED_GENRE"
+}
+
+draw_device() {
+    move_to "$((INFO_ROW + 16))" "$INFO_COL"
+    clear_line
+    if [[ -n "$CACHED_DEVICE" ]]; then
+        printf "${PURPLE}●${RESET} ${GREY}%s${RESET}" "$CACHED_DEVICE"
+    else
+        printf "${GREY}No AirPlay device connected${RESET}"
+    fi
+    LAST_RENDERED_DEVICE="$CACHED_DEVICE"
+}
+
+update_device_if_needed() {
+    [[ "$CACHED_DEVICE" != "$LAST_RENDERED_DEVICE" ]] && draw_device
 }
 
 update_metadata_if_needed() {
@@ -405,44 +562,58 @@ format_time() {
 
 draw_progress_bar() {
     local current="$1" duration="$2"
-    local cols bar_width filled empty start_col
+    local cols track_width inner_width filled remaining start_col
+    local current_text duration_text visible_width
 
     cols="$(terminal_width)"
-    bar_width=$((cols - 22))
-    (( bar_width > 90 )) && bar_width=90
-    (( bar_width < 10 )) && return
+    track_width=$((cols - 26))
+    (( track_width > 64 )) && track_width=64
+    (( track_width < 14 )) && return
+    inner_width=$((track_width - 2))
 
     [[ "$current" =~ ^[0-9]+$ ]] || current=0
     [[ "$duration" =~ ^[0-9]+$ ]] || duration=0
-
-    filled=0
-    (( duration > 0 )) && filled=$((current * bar_width / duration))
-    (( filled < 0 )) && filled=0
-    (( filled > bar_width )) && filled="$bar_width"
-    empty=$((bar_width - filled))
-
-    start_col=$(((cols - bar_width - 12) / 2))
-    (( start_col < 4 )) && start_col=4
+    (( current < 0 )) && current=0
 
     move_to "$PROGRESS_ROW" 1
     clear_line
-    move_to "$PROGRESS_ROW" "$start_col"
 
     if (( duration <= 0 )); then
-        printf "${GREY}--:-- ${DIM}"
-        printf '%*s' "$bar_width" '' | tr ' ' '─'
-        printf "${RESET}${GREY} --:--${RESET}"
+        current_text="$(format_time "$current")"
+        duration_text="--:--"
+        visible_width=$((${#current_text} + 2 + track_width + 2 + ${#duration_text}))
+        start_col=$(((cols - visible_width) / 2))
+        (( start_col < 1 )) && start_col=1
+        move_to "$PROGRESS_ROW" "$start_col"
+
+        printf "${GREY}%s${RESET}  ${GREY}o${RESET}" "$current_text"
+        printf "${DIM}${GREY}"
+        printf '%*s' "$inner_width" '' | tr ' ' '-'
+        printf "${RESET}${GREY}o${RESET}  ${GREY}%s${RESET}" "$duration_text"
+
         LAST_RENDERED_PROGRESS_CURRENT="$current"
         LAST_RENDERED_PROGRESS_DURATION="$duration"
         return
     fi
 
-    printf "${GREY}%s${RESET} " "$(format_time "$current")"
-    printf "${PURPLE_BRIGHT}"
-    (( filled > 0 )) && printf '%*s' "$filled" '' | tr ' ' '━'
+    (( current > duration )) && current="$duration"
+    current_text="$(format_time "$current")"
+    duration_text="$(format_time "$duration")"
+    filled=$((current * (inner_width - 1) / duration))
+    (( filled < 0 )) && filled=0
+    (( filled > inner_width - 1 )) && filled=$((inner_width - 1))
+    remaining=$((inner_width - filled - 1))
+    visible_width=$((${#current_text} + 2 + track_width + 2 + ${#duration_text}))
+    start_col=$(((cols - visible_width) / 2))
+    (( start_col < 1 )) && start_col=1
+    move_to "$PROGRESS_ROW" "$start_col"
+
+    printf "${GREY}%s${RESET}  ${PURPLE_BRIGHT}o" "$current_text"
+    (( filled > 0 )) && printf '%*s' "$filled" '' | tr ' ' '='
+    printf 'O'
     printf "${RESET}${DIM}${GREY}"
-    (( empty > 0 )) && printf '%*s' "$empty" '' | tr ' ' '─'
-    printf "${RESET} ${GREY}%s${RESET}" "$(format_time "$duration")"
+    (( remaining > 0 )) && printf '%*s' "$remaining" '' | tr ' ' '-'
+    printf "o${RESET}  ${GREY}%s${RESET}" "$duration_text"
 
     LAST_RENDERED_PROGRESS_CURRENT="$current"
     LAST_RENDERED_PROGRESS_DURATION="$duration"
@@ -461,7 +632,7 @@ update_progress_display() {
 draw_visualizer_frame() {
     local data="$1"
     local cols max_bars count bar_count spectrum_width spectrum_col
-    local row index value level
+    local row index value scaled full_rows remainder line char
     local values
 
     cols="$(terminal_width)"
@@ -480,41 +651,47 @@ draw_visualizer_frame() {
     spectrum_col=$(((cols - spectrum_width) / 2))
     (( spectrum_col < 2 )) && spectrum_col=2
 
-    for ((row = VISUALIZER_HEIGHT; row >= 1; row--)); do
-        move_to "$((VISUALIZER_ROW + VISUALIZER_HEIGHT - row))" 1
-        clear_line
-        move_to "$((VISUALIZER_ROW + VISUALIZER_HEIGHT - row))" "$spectrum_col"
-        printf "${PURPLE_BRIGHT}"
-
+    for ((row = VISUALIZER_HEIGHT - 1; row >= 0; row--)); do
+        line=""
         for ((index = 0; index < bar_count; index++)); do
             value="${values[$index]}"
             [[ "$value" =~ ^[0-9]+$ ]] || value=0
-            level=$((value * VISUALIZER_HEIGHT / 8))
-            if (( level >= row )); then
-                printf '█'
-            else
-                printf ' '
+            scaled=$((value * VISUALIZER_HEIGHT * 8 * VISUALIZER_GAIN / (CAVA_MAX_RANGE * 100)))
+            (( scaled < 0 )) && scaled=0
+            (( scaled > VISUALIZER_HEIGHT * 8 )) && scaled=$((VISUALIZER_HEIGHT * 8))
+            full_rows=$((scaled / 8))
+            remainder=$((scaled % 8))
+            char=" "
+
+            if (( row < full_rows )); then
+                char="█"
+            elif (( row == full_rows && remainder > 0 )); then
+                case "$remainder" in
+                    1) char="▁" ;;
+                    2) char="▂" ;;
+                    3) char="▃" ;;
+                    4) char="▄" ;;
+                    5) char="▅" ;;
+                    6) char="▆" ;;
+                    7) char="▇" ;;
+                esac
             fi
-            printf ' '
+            line+="$char "
         done
 
-        printf "${RESET}"
+        move_to "$((VISUALIZER_ROW + VISUALIZER_HEIGHT - 1 - row))" "$spectrum_col"
+        printf "${PURPLE_BRIGHT}%s${RESET}" "$line"
     done
 }
 
 draw_visualizer_idle() {
-    local row text
+    local row
     for ((row = 0; row < VISUALIZER_HEIGHT; row++)); do
         move_to "$((VISUALIZER_ROW + row))" 1
         clear_line
     done
 
-    if [[ -z "$CAVA_PID" ]]; then
-        text="cava not installed — visualizer disabled"
-    else
-        text="Waiting for audio..."
-    fi
-    print_centered "$((VISUALIZER_ROW + 3))" "${GREY}${text}${RESET}"
+    print_centered "$((VISUALIZER_ROW + 3))" "${GREY}Waiting for audio...${RESET}"
 }
 
 draw_footer() {
@@ -526,6 +703,7 @@ draw_screen() {
     draw_header
     draw_album_art
     draw_metadata
+    draw_device
     draw_progress_bar "$(get_position_seconds)" "$(get_duration_seconds)"
     draw_footer
 }
@@ -546,31 +724,27 @@ framerate = ${VISUALIZER_FPS}
 
 [input]
 method = pulse
-source = auto
+source = ${CAVA_SOURCE}
 
 [output]
 method = raw
 raw_target = ${CAVA_FIFO}
 data_format = ascii
-ascii_max_range = 8
+ascii_max_range = ${CAVA_MAX_RANGE}
 channels = mono
 
 [smoothing]
-noise_reduction = 65
+noise_reduction = 40
 EOF
 
-if command -v cava >/dev/null 2>&1; then
-    cava -p "$CAVA_CONFIG" >/dev/null 2>&1 &
-    CAVA_PID=$!
-fi
+cava -p "$CAVA_CONFIG" >/dev/null 2>&1 &
+CAVA_PID=$!
 
 hide_cursor
 draw_screen
 draw_visualizer_idle
 
-if [[ -n "$CAVA_PID" ]]; then
-    exec 3<>"$CAVA_FIFO"
-fi
+exec 3<>"$CAVA_FIFO"
 
 last_progress_check_ms=0
 last_quality_check_ms=0
@@ -584,7 +758,14 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
         meta_signature="$(get_file_signature "$META_FILE")"
 
         if [[ -n "$art_signature" && "$art_signature" != "$LAST_ART_SIGNATURE" ]]; then
+            update_accent_from_artwork
+            draw_header
             draw_album_art
+            draw_metadata
+            draw_device
+            LAST_RENDERED_PROGRESS_CURRENT=-1
+            LAST_RENDERED_PROGRESS_DURATION=-1
+            update_progress_display
             LAST_ART_SIGNATURE="$art_signature"
         fi
 
@@ -606,15 +787,13 @@ while kill -0 "$UXPLAY_PID" 2>/dev/null; do
     if (( now_ms - last_quality_check_ms >= QUALITY_INTERVAL_MS )); then
         update_stream_format_cache
         update_header_if_needed
+        update_device_cache
+        update_device_if_needed
         last_quality_check_ms="$now_ms"
     fi
 
-    if [[ -n "$CAVA_PID" ]]; then
-        if IFS= read -r -t 0.016 cava_data <&3; then
-            draw_visualizer_frame "$cava_data"
-        fi
-    else
-        sleep 0.016
+    if IFS= read -r -t 0.02 cava_data <&3; then
+        draw_visualizer_frame "$cava_data"
     fi
 done
 

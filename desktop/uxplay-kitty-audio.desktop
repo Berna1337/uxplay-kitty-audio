@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=UxPlay Kitty Audio
+Comment=Kitty-native AirPlay audio receiver powered by UxPlay
+TryExec=kitty
+Exec=kitty --class uxplay-kitty-audio --title "UxPlay Kitty Audio" uxplay-kitty-audio
+Icon=audio-speakers
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true

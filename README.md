@@ -1,6 +1,6 @@
-# UxPlay Audio TUI
+# UxPlay Kitty Audio
 
-A lightweight terminal UI for **UxPlay's audio receiver**, providing a music-player-style interface for AirPlay audio on Linux.
+A Kitty-native AirPlay audio receiver for Linux, powered by UxPlay—with album artwork, adaptive colors, playback metadata and a real-time audio visualizer.
 
 <img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/80c846e5-50cc-4d75-9b51-36ba90e0c6e1" />
 
@@ -8,40 +8,37 @@ A lightweight terminal UI for **UxPlay's audio receiver**, providing a music-pla
 
 - AirPlay audio reception through UxPlay
 - Track title, artist, album and genre
+- Connected AirPlay device display
 - UTF-8 metadata support, including accented and special characters
-- Album artwork in terminals supporting the Kitty graphics protocol
-- Graceful fallback when inline artwork is unavailable
-- Playback progress and duration
+- Album artwork rendered through Kitty's graphics protocol
+- Accent colors derived automatically from the current album artwork
+- Centered playback timeline with progress and duration
 - Negotiated stream information such as sample rate, bit depth, codec and channels
-- Real-time Cava audio visualizer at up to 60 FPS
+- Real-time, sub-cell Cava audio visualizer at up to 60 FPS
 - Cached playback values to reduce UI glitches
-- Desktop launcher named **AirPlay Audio**
+- Dedicated Kitty desktop launcher
 
 ## Requirements
 
-### Required
-
 - Bash
 - UxPlay
+- Kitty, including the `kitten` helper
+- Cava
+- ImageMagick (`magick`)
+- PulseAudio tools (`pactl`) and a PulseAudio-compatible audio service
 - `iconv`
 - standard GNU/Linux utilities (`awk`, `sed`, `grep`, `stat`, `tail`, `tput`)
 
-### Optional
-
-- **Cava** — real-time audio visualizer
-- **Kitty / kitten** — inline album artwork
-
-The TUI itself can run in other terminals. Inline artwork currently requires support for the Kitty graphics protocol.
+UxPlay Kitty Audio intentionally runs only inside Kitty. When launched from another
+terminal, it exits with a short message explaining the requirement.
 
 ## Fedora
 
-For the main dependencies:
+Install the complete package dependency set:
 
 ```bash
-sudo dnf install uxplay cava
+sudo dnf install uxplay kitty cava ImageMagick pulseaudio-utils
 ```
-
-Kitty can be installed separately if you want inline album artwork.
 
 ## Install
 
@@ -55,10 +52,11 @@ chmod +x install.sh uninstall.sh
 You can then run:
 
 ```bash
-uxplay-audio-tui
+uxplay-kitty-audio
 ```
 
-or search for **AirPlay Audio** in your desktop application launcher.
+or search for **UxPlay Kitty Audio** in your desktop application launcher. The
+launcher opens the application directly in Kitty.
 
 ## Uninstall
 
