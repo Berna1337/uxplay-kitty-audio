@@ -3,7 +3,7 @@
 A friendly Kitty-native AirPlay audio visualizer for Linux, powered by UxPlay—with
 album artwork, adaptive colors, playback metadata and Discord Rich Presence.
 
-<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/80c846e5-50cc-4d75-9b51-36ba90e0c6e1" />
+<img width="2560" height="1440" alt="image" src="https://github.com/user-attachments/assets/b02651c4-131b-4246-b03b-f2531bcfa8d6" />
 
 ## Features
 
